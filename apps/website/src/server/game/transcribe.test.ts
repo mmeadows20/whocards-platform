@@ -1,4 +1,5 @@
-import type {GameSnapshot, GameStatus, Player, RoundStatus} from '@whocards/game'
+import {UPLOAD_GRACE_MS} from '@whocards/game'
+import type {GameSnapshot, GameStatus, Player, RoundStatus, Turn} from '@whocards/game'
 import {describe, expect, it, vi} from 'vitest'
 import {createOpenAiTranscriber, fakeTranscriber, handleTranscribe} from './transcribe'
 import type {ServerTranscriber, TranscribeDeps} from './transcribe'
@@ -14,7 +15,23 @@ const player: Player = {
   consentRecap: false,
 }
 
-const snapshot = (game: GameStatus, round: RoundStatus): GameSnapshot => ({
+const NOW = 1_000_000
+
+const myTurn: Turn = {
+  id: 't1',
+  pairId: 'pair1',
+  roundId: 'r1',
+  playerId: 'p1',
+  questionId: '1',
+  startedAt: NOW - 10_000,
+  finishedAt: null,
+}
+
+const snapshot = (
+  game: GameStatus,
+  round: RoundStatus,
+  turns: Turn[] = [myTurn]
+): GameSnapshot => ({
   game: {id: 'g1', code: 'WORK', title: 'Workshop', status: game, settings: {round: {}}},
   players: [player],
   rounds: [
@@ -33,17 +50,23 @@ const snapshot = (game: GameStatus, round: RoundStatus): GameSnapshot => ({
     },
   ],
   pairs: [],
-  turns: [],
+  turns,
 })
 
-const deps = (overrides: Partial<TranscribeDeps> = {}, state = snapshot('live', 'live')) => ({
-  game: {
-    findPlayerByToken: async (token: string) => (token === 'good' ? player : null),
-    loadSnapshot: async () => state,
-  },
-  transcriber: vi.fn<ServerTranscriber>(fakeTranscriber),
-  ...overrides,
-})
+const deps = (overrides: Partial<TranscribeDeps> = {}, state = snapshot('live', 'live')) => {
+  const claimed = new Set<string>()
+  return {
+    game: {
+      now: () => NOW,
+      findPlayerByToken: async (token: string) => (token === 'good' ? player : null),
+      loadSnapshot: async () => state,
+      claimTranscription: async (turnId: string) => !claimed.has(turnId) && !!claimed.add(turnId),
+      releaseTranscription: async (turnId: string) => void claimed.delete(turnId),
+    },
+    transcriber: vi.fn<ServerTranscriber>(fakeTranscriber),
+    ...overrides,
+  }
+}
 
 const post = (fields: {audio?: Blob; token?: string; language?: string}) => {
   const form = new FormData()
@@ -57,7 +80,7 @@ const audio = new Blob([new Uint8Array(512)], {type: 'audio/webm'})
 const valid = {audio, token: 'good', language: 'hu'}
 
 describe('handleTranscribe', () => {
-  it('returns the transcript for a player in a live round', async () => {
+  it('returns the transcript for a player with a running turn', async () => {
     const d = deps()
     const res = await handleTranscribe(post(valid), d)
     expect(res.status).toBe(200)
@@ -79,9 +102,18 @@ describe('handleTranscribe', () => {
     expect((await handleTranscribe(post({...valid, token: 'bad'}), deps())).status).toBe(401)
   })
 
-  it('rejects when no round is live', async () => {
-    for (const state of [snapshot('live', 'done'), snapshot('ended', 'live')]) {
-      const d = deps({}, state)
+  it('accepts a late upload after the host ended the round or game', async () => {
+    const finished = [{...myTurn, finishedAt: NOW - UPLOAD_GRACE_MS}]
+    for (const state of [snapshot('live', 'done', finished), snapshot('ended', 'done', finished)]) {
+      expect((await handleTranscribe(post(valid), deps({}, state))).status).toBe(200)
+    }
+  })
+
+  it('rejects a player with no turn of their own, or one that ended too long ago', async () => {
+    const stale = [{...myTurn, finishedAt: NOW - UPLOAD_GRACE_MS - 1}]
+    const partners = [{...myTurn, playerId: 'p2'}]
+    for (const turns of [[], stale, partners]) {
+      const d = deps({}, snapshot('live', 'live', turns))
       expect((await handleTranscribe(post(valid), d)).status).toBe(409)
       expect(d.transcriber).not.toHaveBeenCalled()
     }
@@ -100,11 +132,20 @@ describe('handleTranscribe', () => {
     expect((await handleTranscribe(post(valid), deps({transcriber: null}))).status).toBe(503)
   })
 
-  it('answers 502 when the transcriber fails', async () => {
-    const transcriber = vi.fn<ServerTranscriber>(async () => {
-      throw new Error('upstream down')
-    })
-    expect((await handleTranscribe(post(valid), deps({transcriber}))).status).toBe(502)
+  it('refuses a second transcription of the same turn', async () => {
+    const d = deps()
+    expect((await handleTranscribe(post(valid), d)).status).toBe(200)
+    expect((await handleTranscribe(post(valid), d)).status).toBe(409)
+    expect(d.transcriber).toHaveBeenCalledOnce()
+  })
+
+  it('answers 502 when the transcriber fails, and lets the player retry', async () => {
+    const transcriber = vi
+      .fn<ServerTranscriber>(fakeTranscriber)
+      .mockRejectedValueOnce(new Error('upstream down'))
+    const d = deps({transcriber})
+    expect((await handleTranscribe(post(valid), d)).status).toBe(502)
+    expect((await handleTranscribe(post(valid), d)).status).toBe(200)
   })
 })
 

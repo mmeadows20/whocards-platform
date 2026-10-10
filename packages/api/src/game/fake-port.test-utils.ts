@@ -27,6 +27,7 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
   const tokens = new Map<string, string>()
   const responses: StoredResponse[] = []
   const feedback = new Map<string, {rating: number; text: string | null}>()
+  const transcribed = new Set<string>()
 
   const port: GamePort = {
     now: () => clock,
@@ -56,16 +57,19 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
       snapshot.pairs.push({id: nextId('pair'), roundId, playerIds: [...playerIds]})
       return 'ok'
     },
-    addToPair: async ({pairId, roundId, playerId, slot}) => {
+    addToPair: async ({pairId, roundId, playerId}) => {
       const pair = snapshot.pairs.find((p) => p.id === pairId)
       const taken = snapshot.pairs.some(
         (p) => p.roundId === roundId && p.playerIds.includes(playerId)
       )
-      if (!pair || taken || slot > 2 || pair.playerIds.length !== slot) return 'conflict'
+      if (!pair || taken || pair.playerIds.length > 2) return 'conflict'
       pair.playerIds.push(playerId)
       return 'ok'
     },
     startTurn: async ({pairId, playerId, questionId, startedAt, expire}) => {
+      const roundId = snapshot.pairs.find((p) => p.id === pairId)?.roundId
+      const round = snapshot.rounds.find((r) => r.id === roundId)
+      if (!roundId || round?.status !== 'live') return 'conflict'
       for (const e of expire) {
         const turn = snapshot.turns.find((t) => t.id === e.turnId)
         if (turn && turn.finishedAt === null) turn.finishedAt = e.finishedAt
@@ -75,6 +79,7 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
       snapshot.turns.push({
         id: nextId('turn'),
         pairId,
+        roundId,
         playerId,
         questionId,
         startedAt,
@@ -85,6 +90,14 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
     finishTurn: async ({turnId, finishedAt}) => {
       const turn = snapshot.turns.find((t) => t.id === turnId)
       if (turn && turn.finishedAt === null) turn.finishedAt = finishedAt
+    },
+    claimTranscription: async (turnId) => {
+      if (transcribed.has(turnId)) return false
+      transcribed.add(turnId)
+      return true
+    },
+    releaseTranscription: async (turnId) => {
+      transcribed.delete(turnId)
     },
     saveResponse: async (input) => {
       const turn = snapshot.turns.find((t) => t.id === input.turnId)

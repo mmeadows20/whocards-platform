@@ -122,6 +122,10 @@ const memoryStorage = (): Storage => {
   }
 }
 
+const refuse = () => {
+  throw new Error('SecurityError')
+}
+
 describe('createTokenStore', () => {
   it('keys tokens by game code and remembers the last game', () => {
     const store = createTokenStore(memoryStorage())
@@ -133,12 +137,47 @@ describe('createTokenStore', () => {
     expect(store.get('ABCD')).toBeNull()
   })
 
-  it('degrades to no storage when it throws', () => {
+  it('keeps the game in memory for this tab when storage throws', () => {
     const broken = memoryStorage()
-    broken.getItem = () => {
-      throw new Error('SecurityError')
+    broken.getItem = refuse
+    broken.setItem = refuse
+    broken.removeItem = refuse
+    const store = createTokenStore(broken)
+    expect(store.get('ABCD')).toBeNull()
+    store.set('abcd', 'tok')
+    store.setRecords('ABCD', true)
+    expect(store.get('ABCD')).toBe('tok')
+    expect(store.lastCode()).toBe('ABCD')
+    expect(store.records('ABCD')).toBe(true)
+    store.clear('ABCD')
+    expect(store.get('ABCD')).toBeNull()
+  })
+
+  it('prefers this tab over a stale token when storage reads but will not write', () => {
+    const full = memoryStorage()
+    full.setItem('whocards:game:ABCD:token', 'old')
+    full.setItem = refuse
+    full.removeItem = refuse
+    const store = createTokenStore(full)
+    expect(store.get('ABCD')).toBe('old')
+    store.set('ABCD', 'new')
+    expect(store.get('ABCD')).toBe('new')
+    store.clear('ABCD')
+    expect(store.get('ABCD')).toBeNull()
+  })
+
+  it('falls back to memory when localStorage cannot even be read', () => {
+    // Node only defines localStorage from v25, so install the throwing getter by hand.
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    Object.defineProperty(globalThis, 'localStorage', {configurable: true, get: refuse})
+    try {
+      const store = createTokenStore()
+      store.set('ABCD', 'tok')
+      expect(store.get('ABCD')).toBe('tok')
+    } finally {
+      if (original) Object.defineProperty(globalThis, 'localStorage', original)
+      else Reflect.deleteProperty(globalThis, 'localStorage')
     }
-    expect(createTokenStore(broken).get('ABCD')).toBeNull()
   })
 })
 
