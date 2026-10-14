@@ -402,6 +402,20 @@ export const createDrizzleHostStore = <
       .where(eq(hostedGame.id, gameId))
   },
 
+  setAnswerMode: ({gameId, mode}) =>
+    settle(async () => {
+      // The database clock also stamps turn starts (website drizzle-port), so the two compare without skew.
+      const at = sql`floor(extract(epoch from now()) * 1000)::bigint`
+      const entry = sql`jsonb_build_array(jsonb_build_object('mode', ${mode}::text, 'at', ${at}))`
+      const log = sql`coalesce(${hostedGame.settings} -> 'answerModes', '[]'::jsonb) || ${entry}`
+      const rows = await db
+        .update(hostedGame)
+        .set({settings: sql`${hostedGame.settings} || jsonb_build_object('answerModes', ${log})`})
+        .where(and(eq(hostedGame.id, gameId), ne(hostedGame.status, 'ended')))
+        .returning({id: hostedGame.id})
+      if (rows.length === 0) throw new StaleWrite()
+    }),
+
   saveQuestions: async (gameId, questions) => {
     await db
       .update(hostedGame)

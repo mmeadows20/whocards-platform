@@ -1,6 +1,7 @@
 import {TRPCError} from '@trpc/server'
 import {getDeck} from '@whocards/decks'
 import {
+  answerModeAt,
   checkClaim,
   checkFinish,
   checkPair,
@@ -139,7 +140,6 @@ const claim = async (port: GamePort, player: Player): Promise<void> => {
     pairId: myPair.id,
     playerId: player.id,
     questionId,
-    startedAt: now,
     expire: check.expire,
   })
   if (result === 'ok') return
@@ -209,6 +209,10 @@ export const gameRouter = createTRPCRouter({
       const turn = snapshot.turns.find((t) => t.id === input.turnId)
       const round = turn && snapshot.rounds.find((r) => r.id === turn.roundId)
       if (!turn || !round || turn.playerId !== ctx.player.id) throw refuse('not_found')
+      if (!ctx.player.consentTranscript) throw refuse('no_consent')
+      if (answerModeAt(snapshot.game.settings, turn.startedAt) === 'none') {
+        throw refuse('wrong_answer_mode')
+      }
 
       if (turn.finishedAt === null) {
         const finishedAt = Math.min(ctx.game.now(), deadlineOf(round, turn))

@@ -53,6 +53,13 @@ export const roundSettingsSchema = z.object({
 })
 export type RoundSettings = z.infer<typeof roundSettingsSchema>
 
+/** How players answer: speak and transcribe, type, or just talk with nothing captured. */
+export const answerModeSchema = z.enum(['voice', 'type', 'none'])
+export type AnswerMode = z.infer<typeof answerModeSchema>
+
+/** Every host switch, oldest first, stamped by the database clock like turn starts. */
+export const answerModeLogSchema = z.array(z.object({mode: answerModeSchema, at: z.number()}))
+
 /** Who hosts a workshop: a conference or company name. */
 export const organizerSchema = z.string().trim().min(1).max(80)
 
@@ -62,6 +69,7 @@ export const gameSettingsSchema = z.object({
   // Optional: games created before organizers existed have none.
   organizer: organizerSchema.optional(),
   questions: z.array(customQuestionSchema).max(100).optional(),
+  answerModes: answerModeLogSchema.optional(),
 })
 export type GameSettings = z.infer<typeof gameSettingsSchema>
 
@@ -89,6 +97,8 @@ export const refusalSchema = z.enum([
   'no_open_turn',
   'not_your_turn',
   'not_found',
+  'wrong_answer_mode',
+  'no_consent',
 ])
 export type Refusal = z.infer<typeof refusalSchema>
 
@@ -152,6 +162,7 @@ export const turnViewSchema = z.object({
   playerId: z.string(),
   questionId: z.string(),
   questionText: z.string().nullable(),
+  answerMode: answerModeSchema,
   startedAt: z.number(),
   finishedAt: z.number().nullable(),
   /** Server stops the turn at this instant if nobody taps Finish. */

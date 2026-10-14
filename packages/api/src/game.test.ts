@@ -35,8 +35,13 @@ const setup = (rounds: Round[] = [liveRound], settings: GameSettings = game.sett
   const fake = createFakeGamePort({game: {...game, settings}, rounds})
   const as = (playerToken: string | null) =>
     createCaller({recordAnswer: async () => {}, game: fake.port, playerToken})
-  const join = async (name: string, language: GameLanguage = 'en') => {
-    const {token, state} = await as(null).game.join({code: 'abcd', name, language})
+  const join = async (name: string, language: GameLanguage = 'en', consentTranscript = true) => {
+    const {token, state} = await as(null).game.join({
+      code: 'abcd',
+      name,
+      language,
+      consentTranscript,
+    })
     return {caller: as(token), state, token}
   }
   return {fake, as, join}
@@ -304,6 +309,59 @@ describe('game.round.response / game.me', () => {
     })
     expect(saved.phase).toBe('unpaired')
     expect((await a.caller.game.me.get()).responses).toMatchObject([{transcript: 'Kept'}])
+  })
+
+  it('keeps a turn in the mode it was claimed in and refuses answers on a None turn', async () => {
+    const {a, b, fake} = await pairedUp()
+    fake.snapshot.game.settings.answerModes = [{mode: 'none', at: 0}]
+    const turn = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn
+    expect(turn?.answerMode).toBe('none')
+
+    fake.advance(1000)
+    fake.snapshot.game.settings.answerModes.push({mode: 'type', at: fake.port.now()})
+    expect((await a.caller.game.state()).pair?.activeTurn?.answerMode).toBe('none')
+    const answer = {turnId: turn?.id ?? '', language: 'en', durationMs: 0, consent: true} as const
+    expect(await refusalOf(a.caller.game.round.response({...answer, transcript: 'Nope'}))).toBe(
+      'wrong_answer_mode'
+    )
+
+    await a.caller.game.round.turn({action: 'finish'})
+    fake.advance(1000)
+    const next = (await b.caller.game.round.turn({action: 'claim'})).pair?.activeTurn
+    expect(next?.answerMode).toBe('type')
+    const saved = await b.caller.game.round.response({
+      ...answer,
+      turnId: next?.id ?? '',
+      transcript: 'Typed',
+    })
+    expect(saved.phase).toBe('pair_done')
+    expect((await a.caller.game.me.get()).responses).toEqual([])
+  })
+
+  it('keeps a claim in the old mode when the switch is stamped at the same instant', async () => {
+    const {a, fake} = await pairedUp()
+    fake.snapshot.game.settings.answerModes = [{mode: 'none', at: fake.port.now()}]
+    const turn = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn
+    expect(turn?.startedAt).toBe(fake.port.now())
+    expect(turn?.answerMode).toBe('voice')
+  })
+
+  it('refuses any saved answer from a player who chose to play without saving', async () => {
+    const ctx = setup([liveRound], {round: {}, answerModes: [{mode: 'type', at: 0}]})
+    const a = await ctx.join('Ann', 'en', false)
+    const b = await ctx.join('Bo')
+    await a.caller.game.round.pair({partnerCode: b.state.me.pairCode})
+    const turn = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn
+    expect(turn?.answerMode).toBe('type')
+    const save = a.caller.game.round.response({
+      turnId: turn?.id ?? '',
+      language: 'en',
+      transcript: 'Typed anyway',
+      durationMs: 0,
+      consent: true,
+    })
+    expect(await refusalOf(save)).toBe('no_consent')
+    expect((await a.caller.game.me.get()).responses).toEqual([])
   })
 
   it('takes feedback and returns fresh state', async () => {
