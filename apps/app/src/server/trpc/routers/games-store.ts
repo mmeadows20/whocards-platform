@@ -1,7 +1,7 @@
 import {randomBytes} from 'node:crypto'
 
 import {makeCode} from '@whocards/game'
-import type {GameSnapshot, HostedGame, Player, Round} from '@whocards/game'
+import type {GameSettings, GameSnapshot, HostedGame, Player, Round} from '@whocards/game'
 import {
   gamePair,
   gamePairPlayer,
@@ -80,6 +80,7 @@ const toPlayer = (row: typeof gamePlayer.$inferSelect): Player => ({
   email: row.email,
   consentTranscript: row.consentTranscript,
   consentRecap: row.consentRecap,
+  joinedAt: row.createdAt.getTime(),
 })
 
 const toRound = (row: typeof gameRound.$inferSelect): Round => ({
@@ -129,6 +130,27 @@ const lockGame = async (tx: Db, gameId: string) => {
     .where(eq(hostedGame.id, gameId))
     .for('update')
   return game ?? null
+}
+
+const insertGame = async (
+  db: Db,
+  values: {title: string; createdBy: string; settings: GameSettings | SQL}
+): Promise<HostedGame> => {
+  // Codes are short, so collide now and then; the unique index decides. Inside a transaction each try is a savepoint.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const [row] = await db.transaction((tx) =>
+        tx
+          .insert(hostedGame)
+          .values({...values, code: makeCode(GAME_CODE_LENGTH, cryptoRandom)})
+          .returning()
+      )
+      if (row) return toGame(row)
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error
+    }
+  }
+  throw new Error('Could not allocate a unique game code')
 }
 
 /** Host-side writes over the game tables; mirrors apps/website's player port for reads. */
@@ -183,6 +205,7 @@ export const createDrizzleHostStore = <
       title: r.game.title,
       organizer: r.game.settings.organizer ?? null,
       createdBy: r.createdBy,
+      createdById: r.game.createdBy,
       facilitators: readFacilitators(r.game.settings).flatMap((id) => labelOf.get(id) ?? []),
       status: r.game.status,
       createdAt: r.game.createdAt.getTime(),
@@ -191,25 +214,27 @@ export const createDrizzleHostStore = <
     }))
   },
 
-  createGame: async ({title, organizer, createdBy}) => {
-    // Codes are short, so collide now and then; the unique index decides.
-    for (let attempt = 0; attempt < 8; attempt++) {
-      try {
-        const [row] = await db
-          .insert(hostedGame)
-          .values({
-            title,
-            createdBy,
-            settings: {round: {}, organizer},
-            code: makeCode(GAME_CODE_LENGTH, cryptoRandom),
-          })
-          .returning()
-        if (row) return toGame(row)
-      } catch (error) {
-        if (!isUniqueViolation(error)) throw error
+  createGame: ({title, organizer, createdBy}) =>
+    insertGame(db, {title, createdBy, settings: {round: {}, organizer}}),
+
+  copyGame: ({title, createdBy, settings, facilitators, rounds}) =>
+    db.transaction(async (tx) => {
+      // `facilitators` lives in settings outside the GameSettings schema, as setFacilitator writes it.
+      const withHosts = sql`${JSON.stringify({...settings, facilitators})}::jsonb`
+      const game = await insertGame(tx, {title, createdBy, settings: withHosts})
+      if (rounds.length > 0) {
+        await tx.insert(gameRound).values(rounds.map((r) => ({...r, gameId: game.id})))
       }
-    }
-    throw new Error('Could not allocate a unique game code')
+      return game
+    }),
+
+  deleteGame: async (gameId) => {
+    // Players, rounds, pairs, turns, answers and feedback go with it via ON DELETE CASCADE.
+    const rows = await db
+      .delete(hostedGame)
+      .where(and(eq(hostedGame.id, gameId), ne(hostedGame.status, 'live')))
+      .returning({id: hostedGame.id})
+    return rows.length > 0
   },
 
   hostsOf: async (gameId) => {
@@ -289,6 +314,7 @@ export const createDrizzleHostStore = <
           questionId: gameTurn.questionId,
           startedAt: gameTurn.startedAt,
           finishedAt: gameTurn.finishedAt,
+          questionVote: gameTurn.questionVote,
         })
         .from(gameTurn)
         .innerJoin(gamePair, eq(gamePair.id, gameTurn.pairId))
@@ -376,18 +402,19 @@ export const createDrizzleHostStore = <
       await tx.update(hostedGame).set({status: 'ended'}).where(eq(hostedGame.id, gameId))
     }),
 
-  claimRecap: async (gameId, claim) => {
+  claimSend: async (gameId, mailing, claim) => {
+    const sent = sql`${hostedGame.settings} -> ${mailing}::text`
     const rows = await db
       .update(hostedGame)
-      .set({settings: mergeSettings({recap: claim})})
+      .set({settings: mergeSettings({[mailing]: claim})})
       .where(
         and(
           eq(hostedGame.id, gameId),
           eq(hostedGame.status, 'ended'),
           // Unclaimed, or a finished send where nothing went out: retrying can't double-send.
-          sql`(${hostedGame.settings} -> 'recap' is null or (
-            coalesce((${hostedGame.settings} -> 'recap' ->> 'pending')::boolean, false) = false
-            and (${hostedGame.settings} -> 'recap' ->> 'sent')::int = 0
+          sql`(${sent} is null or (
+            coalesce((${sent} ->> 'pending')::boolean, false) = false
+            and (${sent} ->> 'sent')::int = 0
           ))`
         )
       )
@@ -395,10 +422,10 @@ export const createDrizzleHostStore = <
     return rows.length > 0
   },
 
-  saveRecapState: async (gameId, recap) => {
+  saveSendState: async (gameId, mailing, state) => {
     await db
       .update(hostedGame)
-      .set({settings: mergeSettings({recap})})
+      .set({settings: mergeSettings({[mailing]: state})})
       .where(eq(hostedGame.id, gameId))
   },
 
@@ -415,6 +442,14 @@ export const createDrizzleHostStore = <
         .returning({id: hostedGame.id})
       if (rows.length === 0) throw new StaleWrite()
     }),
+
+  ensureStandbyKey: async (gameId, key) => {
+    const kept = sql`coalesce(${hostedGame.settings} -> 'standbyKey', to_jsonb(${key}::text))`
+    await db
+      .update(hostedGame)
+      .set({settings: sql`${hostedGame.settings} || jsonb_build_object('standbyKey', ${kept})`})
+      .where(eq(hostedGame.id, gameId))
+  },
 
   saveQuestions: async (gameId, questions) => {
     await db

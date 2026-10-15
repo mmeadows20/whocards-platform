@@ -5,6 +5,7 @@ export const roundView = (extra: Partial<RoundView> = {}): RoundView => ({
   n: 1,
   status: 'live',
   deckSlug: 'library',
+  physical: false,
   turnSeconds: 60,
   oddRule: 'trio',
   overtime: 'nudge',
@@ -23,6 +24,7 @@ export const turnView = (extra: Partial<TurnView> = {}): TurnView => ({
   startedAt: 0,
   finishedAt: null,
   deadline: 90_000,
+  questionVote: null,
   ...extra,
 })
 

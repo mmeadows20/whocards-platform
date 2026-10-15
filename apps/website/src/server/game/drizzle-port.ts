@@ -1,6 +1,6 @@
 import {createHash, randomBytes} from 'node:crypto'
 import type {GamePort, WriteResult} from '@whocards/api'
-import {makeCode} from '@whocards/game'
+import {makeCode, TRANSCRIPTION_CLAIM_TTL_MS} from '@whocards/game'
 import type {GameSnapshot, HostedGame, Player, Round} from '@whocards/game'
 import {
   gameFeedback,
@@ -12,7 +12,7 @@ import {
   gameTurn,
   hostedGame,
 } from '@whocards/game/db'
-import {and, asc, eq, isNull, sql} from 'drizzle-orm'
+import {and, asc, eq, isNull, lt, notExists, or, sql} from 'drizzle-orm'
 import type {PgDatabase, PgQueryResultHKT} from 'drizzle-orm/pg-core'
 
 const PAIR_CODE_LENGTH = 4
@@ -62,6 +62,7 @@ const toPlayer = (row: typeof gamePlayer.$inferSelect): Player => ({
   email: row.email,
   consentTranscript: row.consentTranscript,
   consentRecap: row.consentRecap,
+  joinedAt: row.createdAt.getTime(),
 })
 
 const toRound = (row: typeof gameRound.$inferSelect): Round => ({
@@ -104,19 +105,31 @@ export const createDrizzleGamePort = <
       return row ? toPlayer(row) : null
     },
 
-    createPlayer: async (input) => {
+    createPlayer: async ({standby, ...input}) => {
       const token = randomBytes(32).toString('base64url')
       // Pair codes are short, so collide now and then; the (game_id, pair_code) unique decides.
       for (let attempt = 0; attempt < 8; attempt++) {
         try {
-          const [row] = await db
-            .insert(gamePlayer)
-            .values({
-              ...input,
-              tokenHash: hashToken(token),
-              pairCode: makeCode(PAIR_CODE_LENGTH, cryptoRandom),
-            })
-            .returning()
+          const row = await db.transaction(async (tx) => {
+            const [inserted] = await tx
+              .insert(gamePlayer)
+              .values({
+                ...input,
+                tokenHash: hashToken(token),
+                pairCode: makeCode(PAIR_CODE_LENGTH, cryptoRandom),
+              })
+              .returning()
+            if (inserted && standby) {
+              const list = sql`coalesce(${hostedGame.settings} -> 'standby', '[]'::jsonb) || to_jsonb(${inserted.id}::text)`
+              await tx
+                .update(hostedGame)
+                .set({
+                  settings: sql`${hostedGame.settings} || jsonb_build_object('standby', ${list})`,
+                })
+                .where(eq(hostedGame.id, input.gameId))
+            }
+            return inserted
+          })
           if (row) return {player: toPlayer(row), token}
         } catch (error) {
           if (!isUniqueViolation(error)) throw error
@@ -154,6 +167,7 @@ export const createDrizzleGamePort = <
             questionId: gameTurn.questionId,
             startedAt: gameTurn.startedAt,
             finishedAt: gameTurn.finishedAt,
+            questionVote: gameTurn.questionVote,
           })
           .from(gameTurn)
           .innerJoin(gamePair, eq(gamePair.id, gameTurn.pairId))
@@ -237,13 +251,36 @@ export const createDrizzleGamePort = <
       const claimed = await db
         .update(gameTurn)
         .set({transcribedAt: sql`now()`})
-        .where(and(eq(gameTurn.id, turnId), isNull(gameTurn.transcribedAt)))
+        .where(
+          and(
+            eq(gameTurn.id, turnId),
+            or(
+              isNull(gameTurn.transcribedAt),
+              and(
+                lt(
+                  gameTurn.transcribedAt,
+                  sql`now() - make_interval(secs => ${TRANSCRIPTION_CLAIM_TTL_MS / 1000})`
+                ),
+                notExists(
+                  db
+                    .select({id: gameResponse.id})
+                    .from(gameResponse)
+                    .where(eq(gameResponse.turnId, turnId))
+                )
+              )
+            )
+          )
+        )
         .returning({id: gameTurn.id})
       return claimed.length > 0
     },
 
     releaseTranscription: async (turnId) => {
       await db.update(gameTurn).set({transcribedAt: null}).where(eq(gameTurn.id, turnId))
+    },
+
+    voteQuestion: async ({turnId, vote}) => {
+      await db.update(gameTurn).set({questionVote: vote}).where(eq(gameTurn.id, turnId))
     },
 
     saveResponse: async (input) => {
@@ -283,6 +320,22 @@ export const createDrizzleGamePort = <
         transcript: r.transcript ?? '',
         createdAt: r.createdAt.getTime(),
       }))
+    },
+
+    editResponse: async ({responseId, playerId, transcript}) => {
+      if (!UUID.test(responseId)) return false
+      const rows = await db
+        .update(gameResponse)
+        .set({transcript})
+        .where(
+          and(
+            eq(gameResponse.id, responseId),
+            eq(gameResponse.playerId, playerId),
+            isNull(gameResponse.deletedAt)
+          )
+        )
+        .returning({id: gameResponse.id})
+      return rows.length > 0
     },
 
     deleteResponse: async ({responseId, playerId}) => {

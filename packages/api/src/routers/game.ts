@@ -7,16 +7,21 @@ import {
   checkPair,
   currentRound,
   customQuestionsOf,
-  deadlineOf,
   deleteResponseInputSchema,
+  editResponseInputSchema,
   feedbackInputSchema,
+  finishedAtOf,
   joinInputSchema,
+  matchName,
+  pairCandidatesInputSchema,
   pairInputSchema,
   pairOf,
+  PHYSICAL_QUESTION_ID,
   planOf,
   playerView,
   questionForTurn,
   questionText,
+  readPairCode,
   refOf,
   responseInputSchema,
   screenInputSchema,
@@ -24,11 +29,14 @@ import {
   turnInputSchema,
   turnsOf,
   usedRefs,
+  voteInputSchema,
 } from '@whocards/game'
 import type {
   GameSnapshot,
   JoinResult,
   MyData,
+  PairCandidate,
+  PairInput,
   Player,
   PlayerState,
   QuestionSources,
@@ -37,6 +45,7 @@ import type {
   ScreenState,
 } from '@whocards/game'
 
+import {saveAnswer} from '../game/answer'
 import type {GamePort} from '../game/port'
 import {refuse} from '../game/refusal'
 import {createTRPCRouter, playerProcedure, publicProcedure} from '../trpc'
@@ -89,11 +98,36 @@ const myData = async (port: GamePort, player: Player): Promise<MyData> => ({
   responses: await port.listResponses(player.id),
 })
 
-const pair = async (port: GamePort, player: Player, partnerCode: string): Promise<void> => {
+/** A typed string that is some player's pair code wins over a name match. */
+const partnerOf = (snapshot: GameSnapshot, round: Round, me: Player, input: PairInput): Player => {
+  if ('partnerCode' in input) {
+    const partner = snapshot.players.find((p) => p.pairCode === input.partnerCode)
+    if (!partner) throw refuse('unknown_code')
+    return partner
+  }
+  if ('partnerId' in input) {
+    const partner = snapshot.players.find((p) => p.id === input.partnerId)
+    if (!partner) throw refuse('unknown_code')
+    return partner
+  }
+  const code = readPairCode(input.partner)
+  const byCode = code ? snapshot.players.find((p) => p.pairCode === code) : undefined
+  if (byCode) return byCode
+
+  const {matches, eligible} = matchName(snapshot, round, me.id, input.partner)
+  const [only] = eligible
+  if (only && eligible.length === 1) return only
+  if (eligible.length > 1) throw refuse('ambiguous_name')
+  const [first] = matches
+  if (!first) throw refuse('unknown_name')
+  // Every match is refused: let the rules say why.
+  return first
+}
+
+const pair = async (port: GamePort, player: Player, input: PairInput): Promise<void> => {
   const snapshot = await load(port, player.gameId)
   const round = liveRound(snapshot)
-  const partner = snapshot.players.find((p) => p.pairCode === partnerCode)
-  if (!partner) throw refuse('unknown_code')
+  const partner = partnerOf(snapshot, round, player, input)
 
   const check = checkPair(snapshot, round, player.id, partner.id)
   if (!check.ok) throw refuse(check.reason)
@@ -170,6 +204,8 @@ export const gameRouter = createTRPCRouter({
       if (!game) throw refuse('unknown_game')
       if (game.status === 'lobby') throw refuse('not_open')
       if (game.status === 'ended') throw refuse('game_over')
+      const standby = input.standbyKey !== undefined
+      if (standby && input.standbyKey !== game.settings.standbyKey) throw refuse('standby_key')
       const {player, token} = await ctx.game.createPlayer({
         gameId: game.id,
         name: input.name,
@@ -177,6 +213,7 @@ export const gameRouter = createTRPCRouter({
         email: input.email ?? null,
         consentTranscript: input.consentTranscript,
         consentRecap: input.consentRecap,
+        standby,
       })
       return {token, state: await freshState(ctx.game, player)}
     }),
@@ -194,9 +231,23 @@ export const gameRouter = createTRPCRouter({
 
   round: createTRPCRouter({
     pair: playerProcedure.input(pairInputSchema).mutation(async ({ctx, input}) => {
-      await pair(ctx.game, ctx.player, input.partnerCode)
+      await pair(ctx.game, ctx.player, input)
       return freshState(ctx.game, ctx.player)
     }),
+
+    /** Players with this name I could pair with now, for the pick list after `ambiguous_name`; never codes or emails. */
+    candidates: playerProcedure
+      .input(pairCandidatesInputSchema)
+      .query(async ({ctx, input}): Promise<PairCandidate[]> => {
+        const snapshot = await load(ctx.game, ctx.player.gameId)
+        const round = liveRound(snapshot)
+        return matchName(snapshot, round, ctx.player.id, input.partner).eligible.map((p) => ({
+          id: p.id,
+          name: p.name,
+          language: p.language,
+          joinedAt: p.joinedAt,
+        }))
+      }),
 
     turn: playerProcedure.input(turnInputSchema).mutation(async ({ctx, input}) => {
       await (input.action === 'claim' ? claim : finish)(ctx.game, ctx.player)
@@ -214,17 +265,25 @@ export const gameRouter = createTRPCRouter({
         throw refuse('wrong_answer_mode')
       }
 
-      if (turn.finishedAt === null) {
-        const finishedAt = Math.min(ctx.game.now(), deadlineOf(round, turn))
-        await ctx.game.finishTurn({turnId: turn.id, finishedAt})
-      }
-      await ctx.game.saveResponse({
-        turnId: turn.id,
+      await saveAnswer(ctx.game, round, turn, {
         playerId: ctx.player.id,
         language: input.language,
         transcript: input.transcript,
         durationMs: input.durationMs,
       })
+      return freshState(ctx.game, ctx.player)
+    }),
+
+    /** Thumbs up or down on my own finished turn's question; null clears it. */
+    vote: playerProcedure.input(voteInputSchema).mutation(async ({ctx, input}) => {
+      const snapshot = await load(ctx.game, ctx.player.gameId)
+      const turn = snapshot.turns.find((t) => t.id === input.turnId)
+      const round = turn && snapshot.rounds.find((r) => r.id === turn.roundId)
+      if (!turn || !round) throw refuse('not_found')
+      if (turn.playerId !== ctx.player.id) throw refuse('not_your_turn')
+      if (turn.questionId === PHYSICAL_QUESTION_ID) throw refuse('physical_card')
+      if (finishedAtOf(round, turn, ctx.game.now()) === null) throw refuse('still_answering')
+      await ctx.game.voteQuestion({turnId: turn.id, vote: input.vote})
       return freshState(ctx.game, ctx.player)
     }),
   }),
@@ -241,6 +300,16 @@ export const gameRouter = createTRPCRouter({
 
   me: createTRPCRouter({
     get: playerProcedure.query(({ctx}) => myData(ctx.game, ctx.player)),
+
+    editResponse: playerProcedure.input(editResponseInputSchema).mutation(async ({ctx, input}) => {
+      const edited = await ctx.game.editResponse({
+        responseId: input.responseId,
+        playerId: ctx.player.id,
+        transcript: input.transcript,
+      })
+      if (!edited) throw refuse('not_found')
+      return myData(ctx.game, ctx.player)
+    }),
 
     deleteResponse: playerProcedure
       .input(deleteResponseInputSchema)

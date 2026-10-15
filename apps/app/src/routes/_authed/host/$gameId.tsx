@@ -1,10 +1,11 @@
-import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
-import {createFileRoute, redirect} from '@tanstack/react-router'
-import {TRPCClientError} from '@trpc/client'
-import {answerModeSchema, CUSTOM_SOURCE, qrPath, sourceOf} from '@whocards/game'
+import {keepPreviousData, useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
+import {createFileRoute, Link, useNavigate} from '@tanstack/react-router'
+import {answerModeSchema, CUSTOM_SOURCE, qrPath, questionPlanSchema, sourceOf} from '@whocards/game'
 import type {AnswerMode, OddRule, Overtime, QuestionPlan} from '@whocards/game'
 import {useMemo, useState} from 'react'
 
+import {ANSWER_MODES, isConflict, requireHost, useHostGame} from '~/components/host/use-host-game'
+import type {Run} from '~/components/host/use-host-game'
 import {Empty, ErrorText, Page, PageHeader, SectionTitle} from '~/components/page'
 import {Badge} from '~/components/ui/badge'
 import {Button, buttonVariants} from '~/components/ui/button'
@@ -12,20 +13,14 @@ import {Card} from '~/components/ui/card'
 import {Input, Label, Select} from '~/components/ui/field'
 import {cn} from '~/lib/cn'
 import {eventLinks} from '~/lib/event-links'
+import {confirmCopyGame, confirmDeleteGame, LIVE_DELETE_HINT} from '~/lib/game-actions'
 import {trpc} from '~/lib/trpc'
-import {roleAtLeast} from '~/server/auth/permissions'
 import type {GameDetail} from '~/server/trpc/routers/games'
 
 export const Route = createFileRoute('/_authed/host/$gameId')({
-  beforeLoad: ({context}) => {
-    if (!context.membership || !roleAtLeast(context.membership.role, 'facilitator')) {
-      throw redirect({to: '/'})
-    }
-  },
+  beforeLoad: requireHost,
   component: HostGame,
 })
-
-const LIVE_REFRESH_MS = 4000
 
 type RoundRow = GameDetail['rounds'][number]
 type CustomRow = GameDetail['questions'][number]
@@ -48,27 +43,26 @@ const settingsOf = (r: RoundSettings): RoundSettings => ({
 
 const isOddRule = (v: string): v is OddRule => v === 'trio' || v === 'sitout'
 const isOvertime = (v: string): v is Overtime => v === 'nudge' || v === 'hard'
-const isMode = (v: string): v is Mode => v === 'random' || v === 'same' || v === 'per-turn'
+const isMode = (v: string): v is Mode =>
+  questionPlanSchema.options.some((o) => o.shape.mode.value === v)
 
 const MODES: Record<Mode, {label: string; option: string}> = {
   random: {label: 'Random', option: 'Random: each player draws their own'},
   same: {label: 'Same question', option: 'Same question for everyone'},
   'per-turn': {label: 'Question per turn', option: 'One question per turn (1st and 2nd speaker)'},
+  physical: {label: 'Physical cards', option: 'Physical cards: players draw from a real deck'},
 }
 
 const planSummary = (round: RoundRow, deckTitle: (slug: string) => string): string => {
   const plan = round.questionPlan
   if (plan.mode === 'random') return `From ${deckTitle(plan.source)}`
+  if (plan.mode === 'physical') return 'Players draw a card from the deck in the room'
   const [a, b] = round.picks.map((t) => `“${t}”`)
   return plan.mode === 'same' ? `Everyone: ${a}` : `Turn 1: ${a} · Turn 2: ${b}`
 }
 
 const clock = (ms: number | null) =>
   ms === null ? '' : new Date(ms).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
-
-// The server answers CONFLICT when another host moved the game on (a lost race or a stale write).
-const isConflict = (error: Error) =>
-  error instanceof TRPCClientError && error.data?.code === 'CONFLICT'
 
 const STATUS = {
   lobby: {label: 'Draft', tone: 'neutral'},
@@ -79,30 +73,23 @@ const STATUS = {
 function HostGame() {
   const {gameId} = Route.useParams()
   const queryClient = useQueryClient()
-  const key = ['games.detail', gameId]
-  const detail = useQuery({
-    queryKey: key,
-    queryFn: () => trpc.games.detail.query({gameId}),
-    refetchInterval: (query) => {
-      const game = query.state.data?.game
-      return game?.status === 'ended' && !game.recap?.pending ? false : LIVE_REFRESH_MS
-    },
-  })
-  const act = useMutation({
-    mutationFn: (run: () => Promise<GameDetail>) => run(),
-    onSuccess: (data) => queryClient.setQueryData(key, data),
-    onError: (error) => {
-      if (isConflict(error)) void queryClient.invalidateQueries({queryKey: key})
-    },
-  })
+  const navigate = useNavigate()
+  const {
+    key,
+    detail,
+    act,
+    busy,
+    run,
+    goLive,
+    endGame,
+    startRound,
+    endRound,
+    setAnswerMode,
+    pendingMode,
+  } = useHostGame(gameId)
   const [editingDetails, setEditingDetails] = useState(false)
 
-  if (detail.isLoading)
-    return (
-      <Page>
-        <p className="text-gray-dark">Loading…</p>
-      </Page>
-    )
+  if (detail.isLoading) return <HostSkeleton />
   if (!detail.data)
     return (
       <Page>
@@ -114,16 +101,25 @@ function HostGame() {
   const draft = game.status === 'lobby'
   const status = STATUS[game.status]
 
-  const endGame = () => {
-    const ok = window.confirm(
-      'End the game? Any live round stops and players can no longer play. You preview the recap email next and send it when ready.'
-    )
-    if (ok) act.mutate(() => trpc.games.endGame.mutate({gameId}))
+  const copyGame = () => {
+    if (!confirmCopyGame(game.title)) return
+    run('copy-game', async () => {
+      const copy = await trpc.games.copyGame.mutate({gameId})
+      void queryClient.invalidateQueries({queryKey: ['games.list']})
+      await navigate({to: '/host/$gameId', params: {gameId: copy.id}})
+      return null
+    })
   }
 
-  const goLive = () => {
-    const ok = window.confirm('Go live? Players can join with the code from now on.')
-    if (ok) act.mutate(() => trpc.games.goLive.mutate({gameId}))
+  const deleteGame = () => {
+    if (!confirmDeleteGame(game.title)) return
+    run('delete-game', async () => {
+      await trpc.games.deleteGame.mutate({gameId})
+      queryClient.removeQueries({queryKey: key})
+      void queryClient.invalidateQueries({queryKey: ['games.list']})
+      await navigate({to: '/host'})
+      return null
+    })
   }
 
   return (
@@ -139,23 +135,64 @@ function HostGame() {
           .filter(Boolean)
           .join(' · ')}
         actions={
-          ended ? null : (
-            <>
-              {editingDetails ? null : (
-                <Button variant="ghost" onClick={() => setEditingDetails(true)}>
-                  Edit details
+          <>
+            {ended ? null : (
+              <>
+                <Link
+                  to="/host/$gameId/present"
+                  params={{gameId}}
+                  target="_blank"
+                  className={buttonVariants({variant: 'accent'})}
+                >
+                  Projector mode ↗
+                </Link>
+                {editingDetails ? null : (
+                  <Button variant="ghost" onClick={() => setEditingDetails(true)}>
+                    Edit details
+                  </Button>
+                )}
+                {draft ? (
+                  <Button
+                    variant="primary"
+                    onClick={goLive}
+                    disabled={act.isPending}
+                    pending={busy === 'go-live'}
+                  >
+                    {busy === 'go-live' ? 'Going live…' : 'Go live'}
+                  </Button>
+                ) : null}
+                <Button
+                  variant="danger"
+                  onClick={endGame}
+                  disabled={act.isPending}
+                  pending={busy === 'end-game'}
+                >
+                  {busy === 'end-game' ? 'Ending…' : 'End game'}
                 </Button>
-              )}
-              {draft ? (
-                <Button variant="primary" onClick={goLive} disabled={act.isPending}>
-                  Go live
-                </Button>
-              ) : null}
-              <Button variant="danger" onClick={endGame} disabled={act.isPending}>
-                End game
+              </>
+            )}
+            <Button
+              variant="secondary"
+              onClick={copyGame}
+              disabled={act.isPending}
+              pending={busy === 'copy-game'}
+            >
+              {busy === 'copy-game' ? 'Copying…' : 'Copy'}
+            </Button>
+            {game.canManageHosts && game.status === 'live' ? (
+              <span className="text-xs text-gray-dark">{LIVE_DELETE_HINT}</span>
+            ) : null}
+            {game.canManageHosts && game.status !== 'live' ? (
+              <Button
+                variant="danger"
+                onClick={deleteGame}
+                disabled={act.isPending}
+                pending={busy === 'delete-game'}
+              >
+                {busy === 'delete-game' ? 'Deleting…' : 'Delete'}
               </Button>
-            </>
-          )
+            ) : null}
+          </>
         }
       />
 
@@ -173,12 +210,16 @@ function HostGame() {
         <DetailsEditor
           title={game.title}
           organizer={game.organizer ?? ''}
-          pending={act.isPending}
+          pending={busy === 'details'}
+          disabled={act.isPending}
           onCancel={() => setEditingDetails(false)}
-          onSave={(input) => {
-            setEditingDetails(false)
-            act.mutate(() => trpc.games.updateGame.mutate({gameId, ...input}))
-          }}
+          onSave={(input) =>
+            run(
+              'details',
+              () => trpc.games.updateGame.mutate({gameId, ...input}),
+              () => setEditingDetails(false)
+            )
+          }
         />
       ) : null}
       {draft ? (
@@ -190,13 +231,29 @@ function HostGame() {
         </Card>
       ) : null}
       {ended ? (
-        <RecapPanel gameId={gameId} recap={game.recap} />
+        <>
+          <MailPanel
+            gameId={gameId}
+            state={game.recap}
+            copy={RECAP_COPY}
+            preview={() => trpc.games.recapPreview.query({gameId})}
+            send={() => trpc.games.sendRecaps.mutate({gameId})}
+          />
+          <MailPanel
+            gameId={gameId}
+            state={game.revisit}
+            copy={REVISIT_COPY}
+            preview={() => trpc.games.revisitPreview.query({gameId})}
+            send={() => trpc.games.sendRevisits.mutate({gameId})}
+          />
+        </>
       ) : (
         <AnswerModePanel
           mode={game.answerMode}
           live={!draft}
-          pending={act.isPending}
-          onChange={(mode) => act.mutate(() => trpc.games.setAnswerMode.mutate({gameId, mode}))}
+          disabled={act.isPending}
+          pendingMode={pendingMode}
+          onChange={setAnswerMode}
         />
       )}
 
@@ -209,6 +266,16 @@ function HostGame() {
           <Stat label="Answers saved" value={counts.responses} />
         </div>
       </div>
+
+      {ended ? null : (
+        <StandbyPanel
+          code={game.code}
+          standbyKey={game.standbyKey}
+          pending={busy === 'standby'}
+          disabled={busy !== null}
+          onEnable={() => run('standby', () => trpc.games.enableStandby.mutate({gameId}))}
+        />
+      )}
 
       <QuestionsPanel
         gameId={gameId}
@@ -224,16 +291,14 @@ function HostGame() {
         liveRoundId={liveRoundId}
         ended={ended}
         draft={draft}
-        pending={act.isPending}
-        run={(fn) => act.mutate(fn)}
+        disabled={act.isPending}
+        busy={busy}
+        run={run}
+        startRound={startRound}
+        endRound={endRound}
       />
 
-      <HostsPanel
-        gameId={gameId}
-        game={game}
-        pending={act.isPending}
-        run={(fn) => act.mutate(fn)}
-      />
+      <HostsPanel gameId={gameId} game={game} disabled={act.isPending} busy={busy} run={run} />
 
       <section>
         <SectionTitle aside={<span className="text-sm text-gray-dark">{players.length}</span>}>
@@ -252,27 +317,56 @@ function HostGame() {
               <div className="min-w-0 flex-1">
                 <p className="truncate font-semibold">{p.name}</p>
                 <p className="text-xs text-gray-dark">
-                  {`${p.language.toUpperCase()}${p.recap ? ' · wants recap' : ''}`}
+                  {`${p.language.toUpperCase()}${p.standby ? ' · standby facilitator' : ''}${p.recap ? ' · wants recap' : ''}`}
                 </p>
               </div>
               <Button
                 variant="ghost"
                 size="sm"
                 disabled={act.isPending}
+                pending={busy === `remove:${p.id}`}
                 onClick={() => {
                   const ok = window.confirm(
                     `Remove ${p.name}? Their saved answers are deleted too; a stranded partner can re-pair.`
                   )
-                  if (ok) act.mutate(() => trpc.games.removePlayer.mutate({gameId, playerId: p.id}))
+                  if (ok)
+                    run(`remove:${p.id}`, () =>
+                      trpc.games.removePlayer.mutate({gameId, playerId: p.id})
+                    )
                 }}
                 className="text-gray-dark hover:text-errorOnDark"
               >
-                Remove
+                {busy === `remove:${p.id}` ? 'Removing…' : 'Remove'}
               </Button>
             </li>
           ))}
         </ul>
       </section>
+    </Page>
+  )
+}
+
+const skeleton = 'animate-pulse rounded-2.5xl bg-white/[0.05] motion-reduce:animate-none'
+
+function HostSkeleton() {
+  return (
+    <Page className="max-w-5xl" aria-busy aria-label="Loading workshop">
+      <div className="mb-8 md:mb-10">
+        <div className={cn(skeleton, 'mb-4 h-4 w-32 rounded-full')} />
+        <div className={cn(skeleton, 'mb-3 h-5 w-16 rounded-full')} />
+        <div className={cn(skeleton, 'h-12 w-2/3 rounded-xl')} />
+      </div>
+      <div className={cn(skeleton, 'mb-6 h-20')} />
+      <div className="mb-12 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)]">
+        <div className={cn(skeleton, 'h-56')} />
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4 lg:grid-cols-2">
+          {['players', 'pairs', 'turns', 'answers'].map((k) => (
+            <div key={k} className={cn(skeleton, 'h-26')} />
+          ))}
+        </div>
+      </div>
+      <div className={cn(skeleton, 'mb-3 h-24')} />
+      <div className={cn(skeleton, 'h-24')} />
     </Page>
   )
 }
@@ -326,16 +420,79 @@ function JoinPanel({code}: Readonly<{code: string}>) {
   )
 }
 
+function StandbyPanel({
+  code,
+  standbyKey,
+  pending,
+  disabled,
+  onEnable,
+}: Readonly<{
+  code: string
+  standbyKey: string | null
+  pending: boolean
+  disabled: boolean
+  onEnable: () => void
+}>) {
+  const link = standbyKey
+    ? `${eventLinks(code).join}&standby=${encodeURIComponent(standbyKey)}`
+    : null
+  const qr = useMemo(() => (link ? qrPath(link) : null), [link])
+  return (
+    <Card className="mb-12 flex flex-col gap-4 sm:flex-row sm:items-center">
+      {qr ? (
+        <svg
+          viewBox={`0 0 ${qr.size} ${qr.size}`}
+          shapeRendering="crispEdges"
+          className="size-36 shrink-0 self-center rounded-2xl bg-white p-2"
+        >
+          <title>Facilitator standby QR code</title>
+          <rect width={qr.size} height={qr.size} fill="#fff" />
+          <path d={qr.d} fill="#000" />
+        </svg>
+      ) : null}
+      <div className="flex min-w-0 flex-col gap-1">
+        <p className="font-semibold">Facilitator on standby</p>
+        <p className="text-sm text-gray-lighter">
+          A facilitator who joins with this link pairs with the odd player out. Keep it off the
+          projector.
+        </p>
+        {link ? (
+          <a
+            href={link}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-2 truncate text-sm text-gray-lighter underline decoration-white/20 underline-offset-4 hover:text-white"
+          >
+            Join as facilitator (standby) ↗
+          </a>
+        ) : (
+          <Button
+            size="sm"
+            className="mt-2 self-start"
+            pending={pending}
+            disabled={disabled}
+            onClick={onEnable}
+          >
+            {pending ? 'Creating…' : 'Create standby link'}
+          </Button>
+        )}
+      </div>
+    </Card>
+  )
+}
+
 function DetailsEditor({
   title: initialTitle,
   organizer: initialOrganizer,
   pending,
+  disabled,
   onCancel,
   onSave,
 }: Readonly<{
   title: string
   organizer: string
   pending: boolean
+  disabled: boolean
   onCancel: () => void
   onSave: (input: {title: string; organizer: string}) => void
 }>) {
@@ -363,10 +520,10 @@ function DetailsEditor({
           />
         </Label>
         <div className="flex gap-2">
-          <Button type="submit" variant="primary" disabled={pending}>
-            Save
+          <Button type="submit" variant="primary" disabled={disabled} pending={pending}>
+            {pending ? 'Saving…' : 'Save'}
           </Button>
-          <Button variant="ghost" onClick={onCancel}>
+          <Button variant="ghost" onClick={onCancel} disabled={pending}>
             Cancel
           </Button>
         </div>
@@ -375,21 +532,17 @@ function DetailsEditor({
   )
 }
 
-const ANSWER_MODES: Record<AnswerMode, {label: string; hint: string}> = {
-  voice: {label: 'Voice', hint: 'Players record, read the transcript, and save it.'},
-  type: {label: 'Type', hint: 'No mic. Players type their answer.'},
-  none: {label: 'None', hint: 'Nothing captured. Phones only pace turns.'},
-}
-
 function AnswerModePanel({
   mode,
   live,
-  pending,
+  disabled,
+  pendingMode,
   onChange,
 }: Readonly<{
   mode: AnswerMode
   live: boolean
-  pending: boolean
+  disabled: boolean
+  pendingMode: string | null
   onChange: (mode: AnswerMode) => void
 }>) {
   return (
@@ -407,7 +560,8 @@ function AnswerModePanel({
             size="sm"
             variant={m === mode ? 'selected' : 'secondary'}
             aria-pressed={m === mode}
-            disabled={pending}
+            disabled={disabled}
+            pending={pendingMode === m}
             onClick={() => {
               if (m !== mode) onChange(m)
             }}
@@ -420,54 +574,104 @@ function AnswerModePanel({
   )
 }
 
-function RecapPanel({
+type MailCopy = {
+  key: string
+  title: string
+  intro?: string
+  sample: string
+  real: string
+  confirm: (recipients: string) => string
+  status: string
+}
+
+const RECAP_COPY: MailCopy = {
+  key: 'recap',
+  title: 'Recap email',
+  sample: 'Nobody asked for a recap, so this preview uses a sample player.',
+  real: "Preview of one player's email. Each player gets their own numbers and question.",
+  confirm: (to) => `Send the recap to ${to}? It goes out once and can't be recalled.`,
+  status: 'Recap emails',
+}
+
+const REVISIT_COPY: MailCopy = {
+  key: 'revisit',
+  title: 'Revisit email',
+  intro:
+    'Optional, for later: the questions each player answered, with a nudge to sit with them again. No answers in it. Goes to players who asked for the recap.',
+  sample: 'Nobody would get this yet, so the preview uses a sample with the room’s questions.',
+  real: "Preview of one player's email. Each player gets the questions they answered.",
+  confirm: (to) => `Send the revisit email to ${to}? It goes out once and can't be recalled.`,
+  status: 'Revisit emails',
+}
+
+type MailPreview = {recipients: number; sample: boolean; html: string}
+
+function MailPanel({
   gameId,
-  recap,
-}: Readonly<{gameId: string; recap: GameDetail['game']['recap']}>) {
+  state,
+  copy,
+  preview: fetchPreview,
+  send: sendNow,
+}: Readonly<{
+  gameId: string
+  state: GameDetail['game']['recap']
+  copy: MailCopy
+  preview: () => Promise<MailPreview>
+  send: () => Promise<GameDetail>
+}>) {
   const queryClient = useQueryClient()
   const preview = useQuery({
-    queryKey: ['games.recapPreview', gameId],
-    queryFn: () => trpc.games.recapPreview.query({gameId}),
+    queryKey: ['games.mailPreview', copy.key, gameId],
+    queryFn: fetchPreview,
     staleTime: Infinity,
   })
   const send = useMutation({
-    mutationFn: () => trpc.games.sendRecaps.mutate({gameId}),
-    onSuccess: (data) => queryClient.setQueryData(['games.detail', gameId], data),
+    mutationFn: sendNow,
+    onSuccess: async (data) => {
+      await queryClient.cancelQueries({queryKey: ['games.detail', gameId]})
+      queryClient.setQueryData(['games.detail', gameId], data)
+    },
     onError: (error) => {
       if (isConflict(error))
         void queryClient.invalidateQueries({queryKey: ['games.detail', gameId]})
     },
   })
   // A send that delivered nothing can go again; anything else is final.
-  const canSend = !recap || (!recap.pending && recap.sent === 0)
+  const canSend = !state || (!state.pending && state.sent === 0)
   const recipients = preview.data?.recipients ?? 0
   const plural = recipients === 1 ? 'player' : 'players'
 
   const status = () => {
-    if (!recap) return null
-    if (recap.pending) return <p className="text-sm text-gray-lighter">Sending…</p>
+    if (!state) return null
+    if (state.pending) return <p className="text-sm text-gray-lighter">Sending…</p>
     return (
-      <p className={cn('text-sm', recap.failed > 0 ? 'text-errorOnDark' : 'text-gray-lighter')}>
-        {`Recap emails: ${recap.sent} sent, ${recap.failed} failed${recap.error ? ` (${recap.error})` : ''}.`}
+      <p className={cn('text-sm', state.failed > 0 ? 'text-errorOnDark' : 'text-gray-lighter')}>
+        {`${copy.status}: ${state.sent} sent, ${state.failed} failed${state.error ? ` (${state.error})` : ''}.`}
       </p>
     )
   }
 
   return (
     <section className="mb-12">
-      <SectionTitle>Recap email</SectionTitle>
+      <SectionTitle>{copy.title}</SectionTitle>
       <Card className="flex flex-col gap-4">
-        {preview.isLoading ? <p className="text-gray-dark">Rendering preview…</p> : null}
+        {copy.intro ? <p className="text-sm text-gray-lighter">{copy.intro}</p> : null}
+        {preview.isLoading ? (
+          <div
+            aria-busy
+            className={cn(skeleton, 'grid h-[36rem] place-items-center text-sm text-gray-dark')}
+          >
+            Rendering preview…
+          </div>
+        ) : null}
         {preview.isError ? <ErrorText>{preview.error.message}</ErrorText> : null}
         {preview.data ? (
           <>
             <p className="text-sm text-gray-lighter">
-              {preview.data.sample
-                ? 'Nobody asked for a recap, so this preview uses a sample player.'
-                : `Preview of one player's email. Each player gets their own numbers and question.`}
+              {preview.data.sample ? copy.sample : copy.real}
             </p>
             <iframe
-              title="Recap email preview"
+              title={`${copy.title} preview`}
               sandbox=""
               srcDoc={preview.data.html}
               className="h-[36rem] w-full rounded-2xl bg-white"
@@ -479,17 +683,16 @@ function RecapPanel({
           <div className="flex flex-wrap items-center gap-3">
             <Button
               variant="primary"
-              disabled={send.isPending || recipients === 0}
+              disabled={!preview.data || recipients === 0}
+              pending={send.isPending}
               onClick={() => {
-                const ok = window.confirm(
-                  `Send the recap to ${recipients} ${plural}? It goes out once and can't be recalled.`
-                )
-                if (ok) send.mutate()
+                const ok = window.confirm(copy.confirm(`${recipients} ${plural}`))
+                if (ok && !send.isPending) send.mutate()
               }}
             >
               {send.isPending
                 ? 'Sending…'
-                : `${recap ? 'Retry: send' : 'Send'} to ${recipients} ${plural}`}
+                : `${state ? 'Retry: send' : 'Send'}${preview.data ? ` to ${recipients} ${plural}` : ''}`}
             </Button>
             {send.isError ? <ErrorText>{send.error.message}</ErrorText> : null}
           </div>
@@ -502,22 +705,25 @@ function RecapPanel({
 function HostsPanel({
   gameId,
   game,
-  pending,
+  disabled,
+  busy,
   run,
 }: Readonly<{
   gameId: string
   game: GameDetail['game']
-  pending: boolean
-  run: (fn: () => Promise<GameDetail>) => void
+  disabled: boolean
+  busy: string | null
+  run: Run
 }>) {
   const options = useQuery({
     queryKey: ['games.facilitatorOptions', gameId, game.facilitators.length],
     queryFn: () => trpc.games.facilitatorOptions.query({gameId}),
     enabled: game.canManageHosts,
+    placeholderData: keepPreviousData,
   })
   const [picked, setPicked] = useState('')
-  const set = (userId: string, on: boolean) =>
-    run(() => trpc.games.setFacilitator.mutate({gameId, userId, on}))
+  const set = (userId: string, on: boolean, onDone?: () => void) =>
+    run(`host:${userId}`, () => trpc.games.setFacilitator.mutate({gameId, userId, on}), onDone)
 
   return (
     <section className="mb-12">
@@ -540,12 +746,13 @@ function HostsPanel({
                 <Button
                   variant="ghost"
                   size="sm"
-                  disabled={pending}
+                  disabled={disabled}
+                  pending={busy === `host:${f.id}`}
                   aria-label={`Remove ${f.label}`}
                   onClick={() => set(f.id, false)}
                   className="text-gray-dark hover:text-errorOnDark"
                 >
-                  ×
+                  {busy === `host:${f.id}` ? null : '×'}
                 </Button>
               ) : null}
             </li>
@@ -555,13 +762,16 @@ function HostsPanel({
           <form
             onSubmit={(event) => {
               event.preventDefault()
-              if (picked) set(picked, true)
-              setPicked('')
+              if (picked) set(picked, true, () => setPicked(''))
             }}
             className="flex flex-col gap-2 sm:flex-row sm:items-end"
           >
             <Label label="Add a co-facilitator" className="flex-1">
-              <Select value={picked} onChange={(event) => setPicked(event.target.value)}>
+              <Select
+                value={picked}
+                disabled={disabled || options.isPlaceholderData}
+                onChange={(event) => setPicked(event.target.value)}
+              >
                 <option value="">Choose a facilitator…</option>
                 {options.data.map((u) => (
                   <option key={u.id} value={u.id}>
@@ -570,8 +780,12 @@ function HostsPanel({
                 ))}
               </Select>
             </Label>
-            <Button type="submit" disabled={pending || !picked}>
-              Add
+            <Button
+              type="submit"
+              disabled={disabled || !picked || options.isPlaceholderData}
+              pending={busy === `host:${picked}`}
+            >
+              {busy === `host:${picked}` ? 'Adding…' : 'Add'}
             </Button>
           </form>
         ) : null}
@@ -632,7 +846,9 @@ function QuestionsPanel({
           pending={save.isPending}
           error={save.error?.message ?? null}
           onCancel={() => setEditing(false)}
-          onSave={(next) => save.mutate({questions: next, baseIds: questions.map((q) => q.id)})}
+          onSave={(next) => {
+            if (!save.isPending) save.mutate({questions: next, baseIds: questions.map((q) => q.id)})
+          }}
         />
       ) : (
         <>
@@ -760,10 +976,10 @@ function QuestionsEditor({
           >
             + Add question
           </Button>
-          <Button type="submit" variant="primary" size="sm" disabled={pending}>
-            Save questions
+          <Button type="submit" variant="primary" size="sm" pending={pending}>
+            {pending ? 'Saving…' : 'Save questions'}
           </Button>
-          <Button variant="ghost" size="sm" onClick={onCancel}>
+          <Button variant="ghost" size="sm" onClick={onCancel} disabled={pending}>
             Cancel
           </Button>
         </div>
@@ -779,8 +995,11 @@ function RoundsPanel({
   liveRoundId,
   ended,
   draft,
-  pending,
+  disabled,
+  busy,
   run,
+  startRound,
+  endRound,
 }: Readonly<{
   gameId: string
   rounds: RoundRow[]
@@ -788,8 +1007,11 @@ function RoundsPanel({
   liveRoundId: string | null
   ended: boolean
   draft: boolean
-  pending: boolean
-  run: (fn: () => Promise<GameDetail>) => void
+  disabled: boolean
+  busy: string | null
+  run: Run
+  startRound: (roundId: string) => void
+  endRound: (roundId: string) => void
 }>) {
   const [editing, setEditing] = useState<string | null>(null)
   const last = rounds.at(-1)
@@ -824,12 +1046,16 @@ function RoundsPanel({
                 initial={settingsOf(round)}
                 custom={custom}
                 questionsLocked={round.status === 'live'}
-                pending={pending}
+                disabled={disabled}
+                pending={busy === `save:${round.id}`}
                 onCancel={() => setEditing(null)}
-                onSave={(settings) => {
-                  setEditing(null)
-                  run(() => trpc.games.updateRound.mutate({gameId, roundId: round.id, settings}))
-                }}
+                onSave={(settings) =>
+                  run(
+                    `save:${round.id}`,
+                    () => trpc.games.updateRound.mutate({gameId, roundId: round.id, settings}),
+                    () => setEditing(null)
+                  )
+                }
               />
             </li>
           ) : (
@@ -883,25 +1109,23 @@ function RoundsPanel({
                   <Button
                     variant="primary"
                     size="sm"
-                    disabled={pending || draft || liveRoundId !== null}
+                    disabled={disabled || draft || liveRoundId !== null}
+                    pending={busy === `start:${round.id}`}
                     title={draft ? 'Go live first' : undefined}
-                    onClick={() =>
-                      run(() => trpc.games.startRound.mutate({gameId, roundId: round.id}))
-                    }
+                    onClick={() => startRound(round.id)}
                   >
-                    Start round
+                    {busy === `start:${round.id}` ? 'Starting…' : 'Start round'}
                   </Button>
                 ) : null}
                 {round.status === 'live' ? (
                   <Button
                     variant="primary"
                     size="sm"
-                    disabled={pending}
-                    onClick={() =>
-                      run(() => trpc.games.endRound.mutate({gameId, roundId: round.id}))
-                    }
+                    disabled={disabled}
+                    pending={busy === `end:${round.id}`}
+                    onClick={() => endRound(round.id)}
                   >
-                    End round
+                    {busy === `end:${round.id}` ? 'Ending…' : 'End round'}
                   </Button>
                 ) : null}
               </div>
@@ -916,12 +1140,16 @@ function RoundsPanel({
             initial={last ? settingsOf(last) : null}
             custom={custom}
             questionsLocked={false}
-            pending={pending}
+            disabled={disabled}
+            pending={busy === 'add-round'}
             onCancel={() => setEditing(null)}
-            onSave={(settings) => {
-              setEditing(null)
-              run(() => trpc.games.addRound.mutate({gameId, settings}))
-            }}
+            onSave={(settings) =>
+              run(
+                'add-round',
+                () => trpc.games.addRound.mutate({gameId, settings}),
+                () => setEditing(null)
+              )
+            }
           />
         </div>
       ) : null}
@@ -964,7 +1192,7 @@ function QuestionPicker({
       <Label label={`${label}: from`}>
         <Select
           value={from}
-          disabled={disabled}
+          disabled={disabled || decks.isLoading}
           onChange={(event) => {
             setSource(event.target.value)
             onChange('')
@@ -982,7 +1210,7 @@ function QuestionPicker({
         <Select
           required
           value={value}
-          disabled={disabled}
+          disabled={disabled || decks.isLoading}
           onChange={(event) => onChange(event.target.value)}
         >
           <option value="" disabled>
@@ -1003,6 +1231,7 @@ function RoundEditor({
   initial,
   custom,
   questionsLocked,
+  disabled,
   pending,
   onCancel,
   onSave,
@@ -1010,6 +1239,7 @@ function RoundEditor({
   initial: RoundSettings | null
   custom: CustomRow[]
   questionsLocked: boolean
+  disabled: boolean
   pending: boolean
   onCancel: () => void
   onSave: (settings: RoundSettings) => void
@@ -1029,6 +1259,7 @@ function RoundEditor({
   const randomSource = source || decks.data?.[0]?.slug || ''
 
   const questionPlan = ((): QuestionPlan | null => {
+    if (mode === 'physical') return {mode}
     if (mode === 'random') return randomSource ? {mode, source: randomSource} : null
     if (mode === 'same') return first ? {mode, question: first} : null
     return first && second ? {mode, questions: [first, second]} : null
@@ -1067,7 +1298,7 @@ function RoundEditor({
           <Label label="Draw from" className="sm:col-span-2">
             <Select
               value={randomSource}
-              disabled={questionsLocked}
+              disabled={questionsLocked || decks.isLoading}
               onChange={(event) => setSource(event.target.value)}
             >
               <option value={CUSTOM_SOURCE}>{`Custom questions (${custom.length})`}</option>
@@ -1078,7 +1309,7 @@ function RoundEditor({
               ))}
             </Select>
           </Label>
-        ) : (
+        ) : mode === 'physical' ? null : (
           <QuestionPicker
             label={mode === 'same' ? 'Everyone' : 'Turn 1'}
             value={first}
@@ -1143,10 +1374,15 @@ function RoundEditor({
           </Label>
         ) : null}
         <div className="flex gap-2 sm:col-span-2">
-          <Button type="submit" variant="primary" disabled={pending || !questionPlan}>
-            Save round
+          <Button
+            type="submit"
+            variant="primary"
+            disabled={disabled || !questionPlan}
+            pending={pending}
+          >
+            {pending ? 'Saving…' : 'Save round'}
           </Button>
-          <Button variant="ghost" onClick={onCancel}>
+          <Button variant="ghost" onClick={onCancel} disabled={pending}>
             Cancel
           </Button>
         </div>

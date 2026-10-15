@@ -1,6 +1,6 @@
 import type {PlayerState, TurnView} from '@whocards/game'
-import {copyFor, playerCopyFor} from '@whocards/game'
-import type {Draft, TimerView, TurnControls} from '@whocards/game/hooks'
+import {copyFor, PHYSICAL_QUESTION_ID, playerCopyFor} from '@whocards/game'
+import type {Draft, GameSession, TimerView, TurnControls} from '@whocards/game/hooks'
 import type {ReactNode} from 'react'
 import {useState} from 'react'
 
@@ -8,9 +8,15 @@ import {formatClock} from '~lib/game/format'
 import {joinPath} from '~lib/game/links'
 import {cn} from '~utils/cn'
 
-import {Button, Screen} from './ui'
+import {QuestionVote} from './question-vote'
+import {Button, Screen, Spinner, textareaClass} from './ui'
 
-type TurnProps = {state: PlayerState; timer: TimerView; turn: TurnControls}
+type TurnProps = {
+  state: PlayerState
+  timer: TimerView
+  turn: TurnControls
+  act: GameSession['act']
+}
 
 const Card = ({
   label,
@@ -23,24 +29,41 @@ const Card = ({
 }) => (
   <div
     className={cn(
-      'bg-darkest text-white flex min-h-44 w-full flex-col gap-3 rounded-3xl p-5 shadow-lg',
+      'bg-background/80 text-white flex min-h-44 w-full flex-col gap-3 rounded-3xl border border-white/10 p-5 shadow-2xl shadow-black/40 backdrop-blur-md',
       locked && 'opacity-50'
     )}
   >
-    <span className='text-primary-light text-sm uppercase tracking-wider'>{label}</span>
+    <span className='text-yellow-300 text-sm font-semibold uppercase tracking-wider'>{label}</span>
     {children}
   </div>
 )
 
-const Question = ({turn}: {turn: TurnView}) => (
-  <p className='text-2xl font-semibold leading-snug'>{turn.questionText ?? ''}</p>
-)
+const Question = ({
+  turn,
+  language,
+  partner,
+}: {
+  turn: TurnView
+  language: PlayerState['me']['language']
+  partner?: boolean
+}) => {
+  const physical = playerCopyFor(language).turn
+  const text =
+    turn.questionId === PHYSICAL_QUESTION_ID
+      ? partner
+        ? physical.physicalPartner
+        : physical.physical
+      : turn.questionText
+  return <p className='text-2xl font-semibold leading-snug'>{text ?? ''}</p>
+}
 
 const Clock = ({timer, language}: {timer: TimerView; language: PlayerState['me']['language']}) => {
   if (!timer.turn) return null
   const copy = playerCopyFor(language)
   return timer.turn.phase === 'talking' ? (
-    <span className='font-mono text-3xl tabular-nums'>{formatClock(timer.turn.remainingMs)}</span>
+    <span className='text-gray-lighter font-mono text-xl tabular-nums'>
+      {formatClock(timer.turn.remainingMs)}
+    </span>
   ) : (
     <span className='text-primary-light text-xl font-semibold'>{copy.turn.overtime}</span>
   )
@@ -73,7 +96,7 @@ const CopyLink = ({code, language}: {code: string; language: PlayerState['me']['
   )
 }
 
-export const Turn = ({state, timer, turn}: TurnProps) => {
+export const Turn = ({state, timer, turn, act}: TurnProps) => {
   const {me, pair} = state
   const copy = playerCopyFor(me.language)
   const rules = copyFor(me.language)
@@ -82,17 +105,22 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
   const answered = (playerId: string) =>
     pair?.turns.some((t) => t.playerId === playerId && t.finishedAt !== null) ?? false
   const partnerAnswering = active !== null && mine === null
+  const myDone = pair?.turns.find((t) => t.playerId === me.id && t.finishedAt !== null) ?? null
 
   const myCard = () => {
     if (mine && turn.micBlocked)
       return (
         <Card label={copy.turn.me}>
-          <Question turn={mine} />
+          <Question turn={mine} language={me.language} />
           <Clock timer={timer} language={me.language} />
           <p className='text-primary-light text-xl font-semibold'>{copy.turn.micBlocked}</p>
           <p>{copy.turn.micBlockedHint}</p>
           <CopyLink code={state.game.code} language={me.language} />
-          <Button className='bg-primary-light text-darkest' onClick={() => void turn.finish()}>
+          <Button
+            className='bg-primary-light text-darkest'
+            pending={turn.stage === 'finishing'}
+            onClick={() => void turn.finish()}
+          >
             {rules.actions.finish}
           </Button>
         </Card>
@@ -101,7 +129,7 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
     if (mine)
       return (
         <Card label={copy.turn.me}>
-          <Question turn={mine} />
+          <Question turn={mine} language={me.language} />
           <Clock timer={timer} language={me.language} />
           {voice && turn.canRecord && turn.stage === 'idle' && (
             <Button className='bg-primary-dark text-white' onClick={() => void turn.record()}>
@@ -117,6 +145,7 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
           {voice && !turn.canRecord && <span className='text-gray-dark'>{copy.turn.justTalk}</span>}
           <Button
             className='bg-primary-light text-darkest'
+            pending={turn.stage === 'finishing'}
             disabled={!['idle', 'starting', 'recording'].includes(turn.stage)}
             onClick={() => void turn.finish()}
           >
@@ -124,10 +153,14 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
           </Button>
         </Card>
       )
-    if (answered(me.id))
+    if (myDone)
       return (
         <Card label={copy.turn.me}>
           <p className='text-xl'>{copy.turn.answered}</p>
+          <Question turn={myDone} language={me.language} />
+          {myDone.questionId !== PHYSICAL_QUESTION_ID && (
+            <QuestionVote turn={myDone} language={me.language} act={act} />
+          )}
         </Card>
       )
     if (partnerAnswering)
@@ -141,11 +174,14 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
         type='button'
         aria-label={rules.actions.claim}
         disabled={turn.stage !== 'idle'}
-        className='w-full text-left transition-transform active:scale-95'
+        className='w-full cursor-pointer rounded-3xl text-left ring-1 ring-yellow-400/50 transition-transform active:scale-95 disabled:cursor-progress'
         onClick={() => void turn.claim()}
       >
         <Card label={copy.turn.me}>
-          <p className='font-title text-4xl'>{rules.actions.claim}</p>
+          <span className='font-title flex items-center gap-3 text-4xl font-bold text-yellow-300'>
+            {turn.stage === 'claiming' && <Spinner className='size-7' />}
+            {rules.actions.claim}
+          </span>
         </Card>
       </button>
     )
@@ -161,7 +197,7 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
           <Card key={partner.id} label={partner.name} locked={!theirs}>
             {theirs ? (
               <>
-                <Question turn={theirs} />
+                <Question turn={theirs} language={me.language} partner />
                 <Clock timer={timer} language={me.language} />
               </>
             ) : (
@@ -176,68 +212,44 @@ export const Turn = ({state, timer, turn}: TurnProps) => {
   )
 }
 
-type ReviewProps = {
+type TypedAnswerProps = {
   state: PlayerState
   timer: TimerView
   turn: TurnControls
-  draft: Draft | null
+  draft: Draft
 }
 
-export const Review = ({state, timer, turn, draft}: ReviewProps) => {
+export const TypedAnswer = ({state, timer, turn, draft}: TypedAnswerProps) => {
   const {language} = state.me
   const copy = playerCopyFor(language)
   const rules = copyFor(language)
-  const [text, setText] = useState(draft?.text ?? '')
-
-  if (turn.stage === 'transcribing' || !draft)
-    return (
-      <Screen title={copy.review.title}>
-        <span className='loading loading-dots loading-lg' />
-        <p>{copy.review.transcribing}</p>
-      </Screen>
-    )
-
-  const skip = (
-    <Button variant='ghost' disabled={turn.stage !== 'review'} onClick={turn.discard}>
-      {rules.actions.skip}
-    </Button>
-  )
-
-  if (draft.kind === 'failed')
-    return (
-      <Screen title={copy.review.title}>
-        <p className='text-center text-xl'>{copy.review.failed}</p>
-        <Button disabled={turn.stage !== 'review'} onClick={() => void turn.retryTranscribe()}>
-          {copy.review.retry}
-        </Button>
-        {skip}
-      </Screen>
-    )
-
-  const typed = draft.kind === 'typed'
-  const asked = typed ? state.pair?.turns.find((t) => t.id === draft.turnId) : undefined
+  const [text, setText] = useState('')
+  const asked = state.pair?.turns.find((t) => t.id === draft.turnId)
   return (
-    <Screen title={copy.review.title}>
+    <Screen title={copy.typing.title}>
       {asked && (
         <Card label={copy.turn.me}>
-          <Question turn={asked} />
+          <Question turn={asked} language={language} />
           <Clock timer={timer} language={language} />
         </Card>
       )}
-      <p className='text-mutedOnLight'>{typed ? copy.review.typeHint : copy.review.hint}</p>
+      <p className='text-gray-dark'>{copy.typing.hint}</p>
       <textarea
-        className='textarea bg-white text-darkest border-darkest/20 min-h-48 w-full rounded-2xl text-lg'
-        aria-label={typed ? copy.review.typeHint : copy.review.title}
+        className={cn(textareaClass, 'min-h-48')}
+        aria-label={copy.typing.hint}
         value={text}
         onChange={(event) => setText(event.target.value)}
       />
       <Button
-        disabled={turn.stage !== 'review' || text.trim() === ''}
+        pending={turn.stage === 'saving'}
+        disabled={turn.stage !== 'typing' || text.trim() === ''}
         onClick={() => void turn.save(text)}
       >
-        {turn.stage === 'saving' ? copy.review.saving : rules.actions.save}
+        {turn.stage === 'saving' ? copy.typing.saving : rules.actions.save}
       </Button>
-      {skip}
+      <Button variant='ghost' disabled={turn.stage !== 'typing'} onClick={turn.discard}>
+        {rules.actions.skip}
+      </Button>
     </Screen>
   )
 }

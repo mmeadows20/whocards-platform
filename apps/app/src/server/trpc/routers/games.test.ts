@@ -1,4 +1,5 @@
 import {getDeck} from '@whocards/decks'
+import {PHYSICAL_QUESTION_ID, PHYSICAL_SOURCE} from '@whocards/game'
 import type {
   GameSnapshot,
   HostedGame,
@@ -13,8 +14,23 @@ import {describe, expect, it, vi} from 'vitest'
 import type {TRPCContext} from '../context'
 import {createCallerFactory} from '../trpc'
 import {createGamesRouter, QUESTIONS_CONFLICT} from './games'
-import type {GameSummary, HostStore, RenderRecap, SendRecaps} from './games'
-import {buildRecaps, closingTimes, previewRecap, readRecapState} from './games-logic'
+import type {
+  GameSummary,
+  HostStore,
+  RenderRecap,
+  RenderRevisit,
+  SendRecaps,
+  SendRevisits,
+} from './games'
+import {
+  buildRecaps,
+  buildRevisits,
+  closingTimes,
+  previewRecap,
+  previewRevisit,
+  questionUrl,
+  readSendState,
+} from './games-logic'
 
 const T0 = 1_760_000_000_000
 const ids = () => {
@@ -74,6 +90,7 @@ const memoryStore = (clock = {now: T0}) => {
           title: g.title,
           organizer: g.settings.organizer ?? null,
           createdBy: labelOf(g.createdBy),
+          createdById: g.createdBy,
           facilitators: g.facilitators.flatMap((f) => labelOf(f) ?? []),
           status: g.status,
           createdAt: g.createdAt,
@@ -93,6 +110,42 @@ const memoryStore = (clock = {now: T0}) => {
       }
       mem.games.push(row)
       return row
+    },
+    copyGame: async ({title, createdBy, settings, facilitators, rounds}) => {
+      const row: Mem['games'][number] = {
+        id: id(),
+        code: `G${mem.games.length + 1}XYZ`,
+        title,
+        status: 'lobby',
+        settings,
+        createdBy,
+        createdAt: clock.now,
+        facilitators,
+      }
+      mem.games.push(row)
+      for (const r of rounds) {
+        mem.rounds.push({
+          ...r,
+          id: id(),
+          gameId: row.id,
+          status: 'pending',
+          startedAt: null,
+          endsAt: null,
+        })
+      }
+      return row
+    },
+    deleteGame: async (gameId) => {
+      const g = game(gameId)
+      if (!g || g.status === 'live') return false
+      const roundIds = new Set(mem.rounds.filter((r) => r.gameId === gameId).map((r) => r.id))
+      mem.games = mem.games.filter((x) => x.id !== gameId)
+      mem.players = mem.players.filter((p) => p.gameId !== gameId)
+      mem.rounds = mem.rounds.filter((r) => r.gameId !== gameId)
+      mem.pairs = mem.pairs.filter((p) => !roundIds.has(p.roundId))
+      mem.turns = mem.turns.filter((t) => !roundIds.has(t.roundId))
+      mem.saved = mem.saved.filter((x) => x.gameId !== gameId)
+      return true
     },
     hostsOf: async (gameId) => {
       const g = game(gameId)
@@ -189,20 +242,24 @@ const memoryStore = (clock = {now: T0}) => {
       if (live) endLive(live.id, endedAt)
       g.status = 'ended'
     },
-    claimRecap: async (gameId, claim) => {
+    claimSend: async (gameId, mailing, claim) => {
       const g = game(gameId)
-      const recap = g && readRecapState(g.settings)
-      if (g?.status !== 'ended' || (recap && (recap.pending || recap.sent > 0))) return false
-      g.settings = Object.assign({}, g.settings, {recap: claim})
+      const state = g && readSendState(g.settings, mailing)
+      if (g?.status !== 'ended' || (state && (state.pending || state.sent > 0))) return false
+      g.settings = Object.assign({}, g.settings, {[mailing]: claim})
       return true
+    },
+    ensureStandbyKey: async (gameId, key) => {
+      const g = game(gameId)
+      if (g) g.settings = {...g.settings, standbyKey: g.settings.standbyKey ?? key}
     },
     saveQuestions: async (gameId, questions) => {
       const g = game(gameId)
       if (g) g.settings = {...g.settings, questions}
     },
-    saveRecapState: async (gameId, recap) => {
+    saveSendState: async (gameId, mailing, state) => {
       const g = game(gameId)
-      if (g) g.settings = Object.assign({}, g.settings, {recap})
+      if (g) g.settings = Object.assign({}, g.settings, {[mailing]: state})
     },
     removePlayer: async ({playerId, release}) => {
       const before = mem.players.length
@@ -228,6 +285,7 @@ const memoryStore = (clock = {now: T0}) => {
       email: null,
       consentTranscript: false,
       consentRecap: false,
+      joinedAt: 0,
       ...extra,
     }
     mem.players.push(player)
@@ -246,7 +304,16 @@ const memoryStore = (clock = {now: T0}) => {
     finishedAt: number | null
   ) => {
     const roundId = mem.pairs.find((p) => p.id === pairId)?.roundId ?? ''
-    const t: Turn = {id: id(), pairId, roundId, playerId, questionId, startedAt, finishedAt}
+    const t: Turn = {
+      id: id(),
+      pairId,
+      roundId,
+      playerId,
+      questionId,
+      startedAt,
+      finishedAt,
+      questionVote: null,
+    }
     mem.turns.push(t)
     return t
   }
@@ -261,19 +328,32 @@ const ctx = (role: Role | null, userId = 'u-avi'): TRPCContext => ({
 })
 
 const renderRecap: RenderRecap = async (props) => `<p>${props.name} · ${props.organizer}</p>`
+const renderRevisit: RenderRevisit = async (props) =>
+  `<p>${props.name}: ${props.questions.map((q) => q.text).join(' | ')}</p>`
 
 const setup = (
   sendRecaps: SendRecaps = vi.fn<SendRecaps>(async (r) => ({
     sent: r.length,
     failed: 0,
     error: null,
+  })),
+  sendRevisits: SendRevisits = vi.fn<SendRevisits>(async (r) => ({
+    sent: r.length,
+    failed: 0,
+    error: null,
   }))
 ) => {
   const fake = memoryStore()
-  const router = createGamesRouter({store: fake.store, sendRecaps, renderRecap})
+  const router = createGamesRouter({
+    store: fake.store,
+    sendRecaps,
+    renderRecap,
+    sendRevisits,
+    renderRevisit,
+  })
   const caller = (role: Role | null = 'facilitator', userId?: string) =>
     createCallerFactory(router)(ctx(role, userId))
-  return {...fake, caller, sendRecaps}
+  return {...fake, caller, sendRecaps, sendRevisits}
 }
 
 const random = (source: string): QuestionPlan => ({mode: 'random', source})
@@ -303,7 +383,11 @@ describe('games router permissions', () => {
     await expect(c.endGame({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
     await expect(c.recapPreview({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
     await expect(c.sendRecaps({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
+    await expect(c.revisitPreview({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
+    await expect(c.sendRevisits({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
     await expect(c.facilitatorOptions({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
+    await expect(c.copyGame({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
+    await expect(c.deleteGame({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
     await expect(c.setFacilitator({gameId, userId: 'u-x', on: true})).rejects.toMatchObject({
       code: 'FORBIDDEN',
     })
@@ -357,11 +441,15 @@ describe('game access', () => {
       c.endGame({gameId}),
       c.recapPreview({gameId}),
       c.sendRecaps({gameId}),
+      c.revisitPreview({gameId}),
+      c.sendRevisits({gameId}),
       c.removePlayer({gameId, playerId: roundId}),
       c.saveQuestions({gameId, questions: [], baseIds: []}),
       c.facilitatorOptions({gameId}),
       c.setFacilitator({gameId, userId: 'u-avi', on: true}),
       c.setAnswerMode({gameId, mode: 'type'}),
+      c.copyGame({gameId}),
+      c.deleteGame({gameId}),
     ]
     for (const call of calls) await expect(call).rejects.toMatchObject({code: 'NOT_FOUND'})
     const missing = c.detail({gameId: '00000000-0000-4000-8000-000000000999'})
@@ -593,6 +681,7 @@ describe('games router', () => {
 
     const detail = await c.detail({gameId})
     expect(detail.counts).toEqual({players: 3, pairs: 1, turnsInProgress: 1, responses: 1})
+    expect(detail.room).toEqual({joined: 3, paired: 2, talking: 1, done: 0})
     expect(JSON.stringify(detail)).not.toContain('@')
   })
 
@@ -736,6 +825,18 @@ describe('custom questions and round plans', () => {
     ])
   })
 
+  it('stores a physical-cards round with no deck and no picks, and starts it', async () => {
+    const {c, gameId} = await withGame()
+    const {rounds} = await c.addRound({
+      gameId,
+      settings: {...ROUND, questionPlan: {mode: 'physical'}},
+    })
+    expect(rounds.map((r) => [r.deckSlug, r.questionPlan.mode, r.picks])).toEqual([
+      [PHYSICAL_SOURCE, 'physical', []],
+    ])
+    expect((await c.startRound({gameId, roundId: rounds[0]!.id})).liveRoundId).toBe(rounds[0]!.id)
+  })
+
   it('rejects plans pointing at unknown decks or questions', async () => {
     const {c, gameId} = await withGame()
     const bad: QuestionPlan[] = [
@@ -767,6 +868,29 @@ describe('custom questions and round plans', () => {
     await expect(save([])).rejects.toMatchObject({
       code: 'BAD_REQUEST',
     })
+  })
+})
+
+describe('standby facilitators', () => {
+  it('mints the standby key once and keeps standby players out of the joined count', async () => {
+    const {caller, mem, join} = setup()
+    const c = caller()
+    const {gameId} = await opened(c)
+    expect((await c.detail({gameId})).game.standbyKey).toBeNull()
+    const key = (await c.enableStandby({gameId})).game.standbyKey
+    expect(key).toMatch(/^[0-9a-f]{32}$/)
+    expect((await c.enableStandby({gameId})).game.standbyKey).toBe(key)
+
+    join(gameId, 'Anna')
+    const fac = join(gameId, 'Fac')
+    const g = mem.games.find((x) => x.id === gameId)!
+    g.settings = {...g.settings, standby: [fac.id]}
+    const detail = await c.detail({gameId})
+    expect(detail.counts.players).toBe(1)
+    expect(detail.players.map((p) => [p.name, p.standby])).toEqual([
+      ['Anna', false],
+      ['Fac', true],
+    ])
   })
 })
 
@@ -905,6 +1029,78 @@ describe('recap preview and send', () => {
   })
 })
 
+describe('revisit email preview and send', () => {
+  it('previews a real recipient with their questions once the game has ended', async () => {
+    const {c, gameId} = await played()
+    await expect(c.revisitPreview({gameId})).rejects.toMatchObject({
+      message: 'End the game first.',
+    })
+    await c.endGame({gameId})
+    expect(await c.revisitPreview({gameId})).toEqual({
+      recipients: 1,
+      sample: false,
+      html: `<p>Anna: ${getDeck('library')!.questions['1']?.en}</p>`,
+    })
+  })
+
+  it('has nobody to send to when nobody asked for email', async () => {
+    const {caller, sendRevisits} = setup()
+    const c = caller()
+    const {id: gameId} = await c.create(GAME)
+    await c.endGame({gameId})
+    expect(await c.revisitPreview({gameId})).toMatchObject({recipients: 0, sample: true})
+    await expect(c.sendRevisits({gameId})).rejects.toMatchObject({
+      message: 'Nobody to send it to.',
+    })
+    expect(sendRevisits).not.toHaveBeenCalled()
+  })
+
+  it('sends once, apart from the recap, even when two hosts press Send', async () => {
+    const {c, caller, gameId, sendRecaps, sendRevisits} = await played()
+    await expect(c.sendRevisits({gameId})).rejects.toMatchObject({message: 'End the game first.'})
+    await c.endGame({gameId})
+    await c.sendRecaps({gameId})
+
+    await Promise.all([
+      caller('facilitator', 'u-avi').sendRevisits({gameId}),
+      caller('admin', 'u-boss').sendRevisits({gameId}),
+    ])
+    await c.sendRevisits({gameId})
+    expect(sendRevisits).toHaveBeenCalledTimes(1)
+    expect(sendRecaps).toHaveBeenCalledTimes(1)
+    const [revisits] = vi.mocked(sendRevisits).mock.calls[0]!
+    expect(revisits.map((r) => r.to)).toEqual(['anna@example.com'])
+    const {game} = await c.detail({gameId})
+    const done = {sentAt: expect.any(Number), sent: 1, failed: 0, error: null, pending: false}
+    expect(game.revisit).toEqual(done)
+    expect(game.recap).toEqual(done)
+  })
+
+  it('records a failed send and retries it once, then never sends again', async () => {
+    let down = true
+    const send = vi.fn<SendRevisits>(async (r) => {
+      if (down) throw new Error('resend down')
+      return {sent: r.length, failed: 0, error: null}
+    })
+    const t = setup(undefined, send)
+    const c = t.caller()
+    const {gameId, roundIds} = await opened(c)
+    await c.startRound({gameId, roundId: roundIds[0]!})
+    const anna = t.join(gameId, 'Anna', {email: 'anna@example.com', consentRecap: true})
+    const bela = t.join(gameId, 'Bela')
+    t.turn(t.pair(roundIds[0]!, [anna.id, bela.id]).id, anna.id, '1', T0, T0 + 60_000)
+    await c.endGame({gameId})
+
+    const failed = await c.sendRevisits({gameId})
+    expect(failed.game.revisit).toMatchObject({sent: 0, failed: 1, error: 'resend down'})
+    expect(failed.game.recap).toBeNull()
+    down = false
+    expect((await c.sendRevisits({gameId})).game.revisit).toMatchObject({sent: 1, error: null})
+    await c.sendRevisits({gameId})
+    expect(send).toHaveBeenCalledTimes(2)
+  })
+})
+
 const round = (id: string, n: number, deckSlug: string): Round => ({
   id,
   gameId: 'g',
@@ -928,6 +1124,7 @@ const player = (id: string, language: 'en' | 'hu'): Player => ({
   email: `${id}@example.com`,
   consentTranscript: false,
   consentRecap: true,
+  joinedAt: 0,
 })
 
 const snapshot = (): GameSnapshot => {
@@ -952,6 +1149,7 @@ const snapshot = (): GameSnapshot => {
         questionId: '1',
         startedAt: T0,
         finishedAt: T0 + 90_000,
+        questionVote: null,
       },
       {
         id: 't2',
@@ -961,6 +1159,7 @@ const snapshot = (): GameSnapshot => {
         questionId: '2',
         startedAt: T0,
         finishedAt: T0 + 30_000,
+        questionVote: null,
       },
       {
         id: 't3',
@@ -970,6 +1169,7 @@ const snapshot = (): GameSnapshot => {
         questionId: '3',
         startedAt: T0,
         finishedAt: null,
+        questionVote: null,
       },
     ],
   }
@@ -1010,6 +1210,18 @@ describe('buildRecaps', () => {
     expect(recaps[2]?.props.asked).toEqual([])
   })
 
+  it('skips standby facilitators as recipients and leaves them out of the room counts', () => {
+    const base = snapshot()
+    const recaps = buildRecaps({
+      snapshot: {...base, game: {...base.game, settings: {round: {}, standby: ['a']}}},
+      savedByPlayer: {},
+      now: T0,
+      random: () => 0,
+    })
+    expect(recaps.map((r) => r.to)).toEqual(['b@example.com', 'c@example.com'])
+    expect(recaps[0]?.props.event).toMatchObject({players: 2, languages: 1})
+  })
+
   it('previews the room for a sample player when nobody asked for a recap', () => {
     const quiet = {...snapshot(), players: snapshot().players.map((p) => ({...p, email: null}))}
     const preview = previewRecap({snapshot: quiet, savedByPlayer: {}, now: T0, random: () => 0})
@@ -1044,6 +1256,31 @@ describe('buildRecaps', () => {
     expect(anna?.props.question).toBe('B, magyarul?')
   })
 
+  it('leaves physical-card turns out of the asked list and the question to take home', () => {
+    const base = snapshot()
+    const physicalRound = {
+      ...round('r2', 2, PHYSICAL_SOURCE),
+      questionPlan: {mode: 'physical'} as const,
+    }
+    const [anna] = buildRecaps({
+      snapshot: {
+        ...base,
+        rounds: [base.rounds[0]!, physicalRound],
+        turns: base.turns.map((t) =>
+          t.id === 't3' ? {...t, questionId: PHYSICAL_QUESTION_ID} : t
+        ),
+      },
+      savedByPlayer: {},
+      now: T0,
+      random: () => 0,
+    })
+    const deck = getDeck('hajnalig')!
+    expect(anna?.props.you.turns).toBe(2)
+    expect(anna?.props.asked).toEqual([deck.questions['1']?.hu])
+    const firstUndrawn = deck.questionIds.find((id) => id !== '1')!
+    expect(anna?.props.question).toBe(deck.questions[firstUndrawn]?.hu)
+  })
+
   it('previews with a question from the custom list too', () => {
     const base = snapshot()
     const preview = previewRecap({
@@ -1063,9 +1300,193 @@ describe('buildRecaps', () => {
   })
 
   it('reads back a stored recap state, older ones as done, and ignores anything else', () => {
-    expect(readRecapState({round: {}})).toBeNull()
+    expect(readSendState({round: {}}, 'recap')).toBeNull()
     expect(
-      readRecapState({round: {}, recap: {sentAt: 1, sent: 2, failed: 0, error: null}})
+      readSendState({round: {}, recap: {sentAt: 1, sent: 2, failed: 0, error: null}}, 'recap')
     ).toEqual({sentAt: 1, sent: 2, failed: 0, error: null, pending: false})
+  })
+})
+
+describe('buildRevisits', () => {
+  const deck = getDeck('hajnalig')!
+
+  it('sends each consenting player their own answered questions, in their language, with card links', () => {
+    const revisits = buildRevisits(snapshot())
+    expect(revisits.map((r) => r.to)).toEqual(['a@example.com', 'b@example.com'])
+    expect(revisits[0]?.props).toEqual({
+      name: 'a',
+      eventTitle: 'SDD',
+      organizer: null,
+      questions: [
+        {text: deck.questions['1']?.hu, url: 'https://whocards.cc/play/hajnalig?lang=hu&q=1'},
+        {text: deck.questions['3']?.hu, url: 'https://whocards.cc/play/hajnalig?lang=hu&q=3'},
+      ],
+      playUrl: 'https://whocards.cc/play',
+      appUrl: 'https://whocards.cc/app',
+    })
+  })
+
+  it('skips standby facilitators, players without consent or email, and anyone who answered nothing', () => {
+    const base = snapshot()
+    const revisits = buildRevisits({
+      ...base,
+      game: {...base.game, settings: {round: {}, standby: ['a']}},
+      players: base.players.map((p) => (p.id === 'b' ? {...p, consentRecap: false} : p)),
+    })
+    expect(revisits).toEqual([])
+    const noEmail = buildRevisits({
+      ...base,
+      players: base.players.map((p) => (p.id === 'a' ? {...p, email: null} : p)),
+    })
+    expect(noEmail.map((r) => r.to)).toEqual(['b@example.com'])
+  })
+
+  it('lists a custom question without a link, since it has no card on the website', () => {
+    const base = snapshot()
+    const [anna] = buildRevisits({
+      ...base,
+      game: {...base.game, settings: {round: {}, questions: [{id: 'c:aaaa', en: 'A?', hu: 'Á?'}]}},
+      turns: base.turns.map((t) => (t.id === 't1' ? {...t, questionId: 'c:aaaa'} : t)),
+    })
+    expect(anna?.props.questions[0]).toEqual({text: 'Á?', url: null})
+  })
+
+  it('links the library deck at /play, falling back to English where the deck has no translation', () => {
+    const sources = {custom: [], decks: getDeck}
+    expect(questionUrl('library:1', 'en', sources)).toBe('https://whocards.cc/play?lang=en&q=1')
+    expect(questionUrl('nope:1', 'en', sources)).toBeNull()
+    const only = {custom: [], decks: () => ({questionIds: ['x'], questions: {x: {en: 'X?'}}})}
+    expect(questionUrl('d:x', 'hu', only)).toBe('https://whocards.cc/play/d?lang=en&q=x')
+  })
+
+  it("previews a sample with the room's first questions when nobody gets the email", () => {
+    const quiet = {...snapshot(), players: snapshot().players.map((p) => ({...p, email: null}))}
+    expect(previewRevisit(quiet)).toMatchObject({
+      recipients: 0,
+      sample: true,
+      props: {
+        name: 'Sample player',
+        questions: ['1', '2', '3'].map((id) => ({text: deck.questions[id]?.en})),
+      },
+    })
+  })
+})
+
+describe('copy and delete a game', () => {
+  it('copies the workshop design into a fresh draft, never the play', async () => {
+    const t = await played()
+    const {c, gameId, mem} = t
+    await c.saveQuestions({gameId, questions: [{en: 'Ours?', hu: 'Mienk?'}], baseIds: []})
+    await c.addRound({
+      gameId,
+      settings: {
+        questionPlan: {mode: 'same', question: 'library:1'},
+        turnSeconds: 90,
+        oddRule: 'sitout',
+        overtime: 'hard',
+        overtimeSeconds: 15,
+      },
+    })
+    await c.setAnswerMode({gameId, mode: 'type'})
+    await c.setAnswerMode({gameId, mode: 'none'})
+    await c.enableStandby({gameId})
+    await c.setFacilitator({gameId, userId: 'u-tamas', on: true})
+    await c.endGame({gameId})
+    await c.sendRecaps({gameId})
+
+    const copy = await c.copyGame({gameId})
+    expect(copy).toMatchObject({title: 'SDD (copy)', status: 'lobby'})
+    expect(copy.code).not.toBe(mem.games[0]?.code)
+    expect(copy.settings).toEqual({
+      round: {},
+      organizer: 'SDD Conf',
+      questions: [expect.objectContaining({en: 'Ours?', hu: 'Mienk?'})],
+      answerModes: [{mode: 'none', at: 0}],
+    })
+
+    const detail = await c.detail({gameId: copy.id})
+    expect(detail.players).toEqual([])
+    expect(detail.counts).toEqual({players: 0, pairs: 0, turnsInProgress: 0, responses: 0})
+    expect(detail.game).toMatchObject({
+      createdBy: 'Avi',
+      facilitators: [{id: 'u-tamas', label: 'Tamas'}],
+      answerMode: 'none',
+      recap: null,
+      standbyKey: null,
+    })
+    expect(detail.rounds.map((r) => [r.n, r.status, r.startedAt, r.pairs, r.turns])).toEqual([
+      [1, 'pending', null, 0, 0],
+      [2, 'pending', null, 0, 0],
+    ])
+    expect(detail.rounds[1]).toMatchObject({
+      questionPlan: {mode: 'same', question: 'library:1'},
+      turnSeconds: 90,
+      oddRule: 'sitout',
+      overtime: 'hard',
+      overtimeSeconds: 15,
+    })
+    // The original is untouched.
+    expect((await c.detail({gameId})).players).toHaveLength(3)
+  })
+
+  it('lets a co-facilitator copy, keeping the creator on as co-host, but not delete', async () => {
+    const {caller, mine: gameId} = await twoGames()
+    await caller('facilitator', 'u-avi').setFacilitator({gameId, userId: 'u-tamas', on: true})
+    const tamas = caller('facilitator', 'u-tamas')
+    const copy = await tamas.copyGame({gameId})
+    const detail = await tamas.detail({gameId: copy.id})
+    expect(detail.game).toMatchObject({
+      title: 'Mine (copy)',
+      canManageHosts: true,
+      facilitators: [{id: 'u-avi', label: 'Avi'}],
+    })
+    await expect(tamas.deleteGame({gameId})).rejects.toMatchObject({code: 'FORBIDDEN'})
+    const list = await tamas.list()
+    expect(list.map((g) => [g.title, g.canManage])).toEqual([
+      ['Mine (copy)', true],
+      ['Theirs', true],
+      ['Mine', false],
+    ])
+  })
+
+  it('caps the copied title at the editable length', async () => {
+    const {caller} = setup()
+    const c = caller()
+    const {id: gameId} = await c.create({title: 'x'.repeat(80), organizer: 'A'})
+    const copy = await c.copyGame({gameId})
+    expect(copy.title).toHaveLength(80)
+    expect(copy.title.endsWith(' (copy)')).toBe(true)
+  })
+
+  it('refuses to delete a live game, then deletes it and everything under it once ended', async () => {
+    const {c, gameId, mem} = await played()
+    await expect(c.deleteGame({gameId})).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+      message: 'End the game first.',
+    })
+    await c.endGame({gameId})
+    expect(await c.deleteGame({gameId})).toEqual({deleted: true})
+    expect(mem).toMatchObject({games: [], players: [], rounds: [], pairs: [], turns: []})
+    await expect(c.detail({gameId})).rejects.toMatchObject({code: 'NOT_FOUND'})
+  })
+
+  it('says a game deleted meanwhile is gone, not live', async () => {
+    const {c, gameId} = await played()
+    await c.endGame({gameId})
+    const [first, second] = await Promise.allSettled([
+      c.deleteGame({gameId}),
+      c.deleteGame({gameId}),
+    ])
+    expect(first).toMatchObject({status: 'fulfilled', value: {deleted: true}})
+    expect(second).toMatchObject({status: 'rejected', reason: {code: 'NOT_FOUND'}})
+  })
+
+  it('deletes a draft, and lets admins delete anyone’s game', async () => {
+    const {caller, mine, theirs} = await twoGames()
+    expect(await caller('facilitator', 'u-avi').deleteGame({gameId: mine})).toEqual({
+      deleted: true,
+    })
+    expect(await caller('admin', 'u-boss').deleteGame({gameId: theirs})).toEqual({deleted: true})
+    expect(await caller('owner', 'u-own').list()).toEqual([])
   })
 })

@@ -1,4 +1,11 @@
-import type {GameLanguage, GameSnapshot, HostedGame, Player, ResponseRecord} from '@whocards/game'
+import type {
+  GameLanguage,
+  GameSnapshot,
+  HostedGame,
+  Player,
+  QuestionVote,
+  ResponseRecord,
+} from '@whocards/game'
 
 /** A write the database refused on a uniqueness rule, i.e. someone else got there first. */
 export type WriteResult = 'ok' | 'conflict'
@@ -10,7 +17,7 @@ export type GamePort = {
   random: () => number
   findGameByCode: (code: string) => Promise<HostedGame | null>
   findPlayerByToken: (token: string) => Promise<Player | null>
-  /** Mints the bearer token and a pair code unique within the game. */
+  /** Mints the bearer token and a pair code unique within the game; `standby` also appends to `settings.standby` in the same transaction. */
   createPlayer: (input: {
     gameId: string
     name: string
@@ -18,6 +25,7 @@ export type GamePort = {
     email: string | null
     consentTranscript: boolean
     consentRecap: boolean
+    standby: boolean
   }) => Promise<{player: Player; token: string}>
   loadSnapshot: (gameId: string) => Promise<GameSnapshot | null>
   createPair: (input: {roundId: string; playerIds: [string, string]}) => Promise<WriteResult>
@@ -35,10 +43,12 @@ export type GamePort = {
   }) => Promise<WriteResult>
   /** No-op if the turn is already finished. */
   finishTurn: (input: {turnId: string; finishedAt: number}) => Promise<void>
-  /** False if the turn already has a transcription in flight or done. */
+  /** False while another transcription of the turn is in flight, or once one produced its answer. */
   claimTranscription: (turnId: string) => Promise<boolean>
   /** Frees the claim after a failed transcription so the player can retry. */
   releaseTranscription: (turnId: string) => Promise<void>
+  /** Null clears the vote. */
+  voteQuestion: (input: {turnId: string; vote: QuestionVote | null}) => Promise<void>
   /** One response per turn; saving again replaces it. */
   saveResponse: (input: {
     turnId: string
@@ -49,6 +59,12 @@ export type GamePort = {
   }) => Promise<void>
   /** Live (not deleted) responses, oldest first. */
   listResponses: (playerId: string) => Promise<ResponseRecord[]>
+  /** Replaces the transcript; false if it isn't this player's live response. */
+  editResponse: (input: {
+    responseId: string
+    playerId: string
+    transcript: string
+  }) => Promise<boolean>
   /** Soft-deletes and wipes the transcript; false if it isn't this player's live response. */
   deleteResponse: (input: {responseId: string; playerId: string}) => Promise<boolean>
   /** One feedback per player; sending again replaces it. */

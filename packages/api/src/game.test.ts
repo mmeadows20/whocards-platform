@@ -1,6 +1,7 @@
 import {TRPCError} from '@trpc/server'
 import {fetchRequestHandler} from '@trpc/server/adapters/fetch'
-import type {GameLanguage, GameSettings, HostedGame, Round} from '@whocards/game'
+import {PHYSICAL_QUESTION_ID, PHYSICAL_SOURCE} from '@whocards/game'
+import type {GameLanguage, GameSettings, HostedGame, PlayerState, Round} from '@whocards/game'
 import {describe, expect, it} from 'vitest'
 import {z} from 'zod'
 
@@ -141,6 +142,94 @@ describe('game.round.pair', () => {
   })
 })
 
+describe('game.round.pair by name', () => {
+  it('pairs on a unique name, ignoring case, accents and spaces', async () => {
+    const {join} = setup()
+    const a = await join('Ann')
+    await join('Áron')
+    const paired = await a.caller.game.round.pair({partner: '  aron '})
+    expect(paired.pair?.partners.map((p) => p.name)).toEqual(['Áron'])
+  })
+
+  it('lets a pair code win over a name, and refuses unknown names', async () => {
+    const {join} = setup()
+    const a = await join('Ann')
+    const b = await join('Bo')
+    await join(a.state.me.pairCode)
+    const paired = await b.caller.game.round.pair({partner: a.state.me.pairCode.toLowerCase()})
+    expect(paired.pair?.partners.map((p) => p.id)).toEqual([a.state.me.id])
+    const c = await join('Cy')
+    expect(await refusalOf(c.caller.game.round.pair({partner: 'Zed'}))).toBe('unknown_name')
+  })
+
+  it('lists namesakes with join time and language, skipping ones I cannot pair with', async () => {
+    const ctx = setup([{...liveRound, oddRule: 'sitout'}])
+    const {join} = ctx
+    const a = await join('Ann')
+    const anna1 = await join('Anna')
+    ctx.fake.advance(60_000)
+    const anna2 = await join('anna', 'hu')
+    expect(await refusalOf(a.caller.game.round.pair({partner: 'ANNA'}))).toBe('ambiguous_name')
+    expect(await a.caller.game.round.candidates({partner: 'Anna'})).toEqual([
+      {id: anna1.state.me.id, name: 'Anna', language: 'en', joinedAt: 1_000_000},
+      {id: anna2.state.me.id, name: 'anna', language: 'hu', joinedAt: 1_060_000},
+    ])
+    const picked = await a.caller.game.round.pair({partnerId: anna2.state.me.id})
+    expect(picked.pair?.partners.map((p) => p.name)).toEqual(['anna'])
+
+    const b = await join('Bo')
+    expect(await b.caller.game.round.candidates({partner: 'anna'})).toEqual([
+      expect.objectContaining({id: anna1.state.me.id, name: 'Anna'}),
+    ])
+  })
+
+  it("reports the rule's reason when every namesake is refused", async () => {
+    const {join} = setup([{...liveRound, oddRule: 'sitout'}])
+    const a = await join('Ann')
+    await join('Bo')
+    const c = await join('Cy')
+    await a.caller.game.round.pair({partner: 'bo'})
+    expect(await refusalOf(c.caller.game.round.pair({partner: 'Ann'}))).toBe('partner_busy')
+  })
+})
+
+const KEY = 'standby-secret-0123456789'
+const joinStandby = async (ctx: ReturnType<typeof setup>, standbyKey: string) => {
+  const {token, state} = await ctx.as(null).game.join({
+    code: 'ABCD',
+    name: 'Fac',
+    language: 'en',
+    standbyKey,
+  })
+  return {caller: ctx.as(token), state}
+}
+
+describe('standby facilitators', () => {
+  it('refuses a wrong key and a game without one', async () => {
+    expect(await refusalOf(joinStandby(setup(), KEY))).toBe('standby_key')
+    const ctx = setup([liveRound], {round: {}, standbyKey: KEY})
+    expect(await refusalOf(joinStandby(ctx, 'guess-guess-guess-guess'))).toBe('standby_key')
+  })
+
+  it('covers only the odd one out and stays off the projector counts', async () => {
+    const ctx = setup([liveRound], {round: {}, standbyKey: KEY})
+    const fac = await joinStandby(ctx, KEY)
+    expect(fac.state.phase).toBe('standby')
+    const a = await ctx.join('Ann')
+    const b = await ctx.join('Bo')
+    const c = await ctx.join('Cy')
+
+    expect(await refusalOf(a.caller.game.round.pair({partner: 'Fac'}))).toBe('standby_partner')
+    await a.caller.game.round.pair({partnerCode: b.state.me.pairCode})
+    expect((await c.caller.game.state()).phase).toBe('find_facilitator')
+    const paired = await c.caller.game.round.pair({partner: 'fac'})
+    expect(paired.pair?.partners.map((p) => p.name)).toEqual(['Fac'])
+
+    const screen = await ctx.as(null).game.screen({code: 'ABCD'})
+    expect(screen.counts).toMatchObject({joined: 3, paired: 3})
+  })
+})
+
 const pairedUp = async () => {
   const ctx = setup()
   const a = await ctx.join('Ann')
@@ -256,6 +345,35 @@ describe('question plans', () => {
     expect(asked.map((q) => q.id)).toEqual(['c:bbbb', 'library:2', 'c:bbbb'])
     expect(asked[1]?.text).toEqual(expect.any(String))
   })
+
+  it('gives physical-card turns the sentinel and no text, saves answers, and refuses votes', async () => {
+    const physical: Round = {
+      ...liveRound,
+      deckSlug: PHYSICAL_SOURCE,
+      questionPlan: {mode: 'physical'},
+    }
+    const {join} = setup([physical], settings)
+    const a = await join('Ann')
+    const b = await join('Bo')
+    await a.caller.game.round.pair({partnerCode: b.state.me.pairCode})
+    const claimed = await a.caller.game.round.turn({action: 'claim'})
+    expect(claimed.round?.physical).toBe(true)
+    const turn = claimed.pair?.activeTurn
+    expect(turn).toMatchObject({questionId: PHYSICAL_QUESTION_ID, questionText: null})
+
+    const saved = await a.caller.game.round.response({
+      turnId: turn?.id ?? '',
+      language: 'en',
+      transcript: 'I drew the one about mornings.',
+      durationMs: 5000,
+      consent: true,
+    })
+    expect(saved.phase).toBe('answered')
+    expect((await a.caller.game.me.get()).responses[0]?.questionId).toBe(PHYSICAL_QUESTION_ID)
+    expect(await refusalOf(a.caller.game.round.vote({turnId: turn?.id ?? '', vote: 1}))).toBe(
+      'physical_card'
+    )
+  })
 })
 
 describe('game.round.response / game.me', () => {
@@ -294,6 +412,36 @@ describe('game.round.response / game.me', () => {
     expect(await refusalOf(b.caller.game.me.deleteResponse({responseId}))).toBe('not_found')
     expect((await a.caller.game.me.deleteResponse({responseId})).responses).toEqual([])
     expect(await refusalOf(a.caller.game.me.deleteResponse({responseId}))).toBe('not_found')
+  })
+
+  it('edits only my own live transcript, with the same rules as saving', async () => {
+    const {a, b} = await pairedUp()
+    const turn = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn
+    await a.caller.game.round.response({
+      turnId: turn?.id ?? '',
+      language: 'en',
+      transcript: 'First take',
+      durationMs: 1000,
+      consent: true,
+    })
+    const responseId = (await a.caller.game.me.get()).responses[0]?.id ?? ''
+
+    const edited = await a.caller.game.me.editResponse({responseId, transcript: '  Better take '})
+    expect(edited.responses).toMatchObject([{id: responseId, transcript: 'Better take'}])
+    expect(
+      await refusalOf(b.caller.game.me.editResponse({responseId, transcript: 'Mine now'}))
+    ).toBe('not_found')
+    await expect(a.caller.game.me.editResponse({responseId, transcript: '   '})).rejects.toThrow(
+      /too_small/
+    )
+    await expect(
+      a.caller.game.me.editResponse({responseId, transcript: 'x'.repeat(20_001)})
+    ).rejects.toThrow(/too_big/)
+
+    await a.caller.game.me.deleteResponse({responseId})
+    expect(await refusalOf(a.caller.game.me.editResponse({responseId, transcript: 'Back'}))).toBe(
+      'not_found'
+    )
   })
 
   it('still saves my turn after the host removed my partner and released me', async () => {
@@ -346,6 +494,26 @@ describe('game.round.response / game.me', () => {
     expect(turn?.answerMode).toBe('voice')
   })
 
+  it('saves answers from a player who consented while the game was in None mode', async () => {
+    const ctx = setup([liveRound], {round: {}, answerModes: [{mode: 'none', at: 0}]})
+    const a = await ctx.join('Ann')
+    const b = await ctx.join('Bo')
+    await a.caller.game.round.pair({partnerCode: b.state.me.pairCode})
+    ctx.fake.advance(1000)
+    ctx.fake.snapshot.game.settings.answerModes?.push({mode: 'type', at: ctx.fake.port.now()})
+    ctx.fake.advance(1000)
+    const turn = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn
+    expect(turn?.answerMode).toBe('type')
+    await a.caller.game.round.response({
+      turnId: turn?.id ?? '',
+      language: 'en',
+      transcript: 'Typed later',
+      durationMs: 0,
+      consent: true,
+    })
+    expect((await a.caller.game.me.get()).responses).toMatchObject([{transcript: 'Typed later'}])
+  })
+
   it('refuses any saved answer from a player who chose to play without saving', async () => {
     const ctx = setup([liveRound], {round: {}, answerModes: [{mode: 'type', at: 0}]})
     const a = await ctx.join('Ann', 'en', false)
@@ -372,6 +540,44 @@ describe('game.round.response / game.me', () => {
   })
 })
 
+const myTurn = (state: PlayerState, playerId: string) =>
+  state.pair?.turns.find((t) => t.playerId === playerId)
+
+describe('game.round.vote', () => {
+  it('lets me vote on my own finished question, change it, and clear it', async () => {
+    const {a, b} = await pairedUp()
+    const turnId = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn?.id ?? ''
+    expect(await refusalOf(a.caller.game.round.vote({turnId, vote: 1}))).toBe('still_answering')
+
+    await a.caller.game.round.turn({action: 'finish'})
+    const up = await a.caller.game.round.vote({turnId, vote: 1})
+    expect(myTurn(up, a.state.me.id)?.questionVote).toBe(1)
+    const down = await a.caller.game.round.vote({turnId, vote: -1})
+    expect(myTurn(down, a.state.me.id)?.questionVote).toBe(-1)
+    expect(myTurn(await b.caller.game.state(), a.state.me.id)?.questionVote).toBeNull()
+
+    const cleared = await a.caller.game.round.vote({turnId, vote: null})
+    expect(myTurn(cleared, a.state.me.id)?.questionVote).toBeNull()
+  })
+
+  it("refuses someone else's turn and an unknown turn", async () => {
+    const {a, b} = await pairedUp()
+    const turnId = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn?.id ?? ''
+    await a.caller.game.round.turn({action: 'finish'})
+    expect(await refusalOf(b.caller.game.round.vote({turnId, vote: 1}))).toBe('not_your_turn')
+    expect(await refusalOf(a.caller.game.round.vote({turnId: 'nope', vote: 1}))).toBe('not_found')
+  })
+
+  it('takes a vote on a timed-out turn in None mode', async () => {
+    const {a, fake} = await pairedUp()
+    fake.snapshot.game.settings.answerModes = [{mode: 'none', at: 0}]
+    const turnId = (await a.caller.game.round.turn({action: 'claim'})).pair?.activeTurn?.id ?? ''
+    fake.advance(90_000)
+    const state = await a.caller.game.round.vote({turnId, vote: 1})
+    expect(myTurn(state, a.state.me.id)).toMatchObject({answerMode: 'none', questionVote: 1})
+  })
+})
+
 describe('game.screen', () => {
   it('shows counts to anyone with the code', async () => {
     const {a, as} = await pairedUp()
@@ -390,7 +596,16 @@ describe('game.screen', () => {
       title: 'Workshop',
       organizer: 'SDD Conf',
       status: 'lobby',
+      answerMode: 'voice',
     })
+  })
+
+  it('shows the answer mode the next turn gets, so joining can skip the recording choice', async () => {
+    const fake = createFakeGamePort({
+      game: {...game, settings: {round: {}, answerModes: [{mode: 'none', at: 0}]}},
+    })
+    const caller = createCaller({recordAnswer: async () => {}, game: fake.port, playerToken: null})
+    expect((await caller.game.screen({code: 'ABCD'})).game.answerMode).toBe('none')
   })
 })
 

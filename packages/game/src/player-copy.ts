@@ -13,11 +13,15 @@ export type PlayerCopy = {
     code: string
     next: string
     hostedBy: string
+    standby: string
   }
   consent: {
     title: string
     transcript: string
     transcriptHint: string
+    typed: string
+    typedHint: string
+    later: string
     recap: string
     email: string
     play: string
@@ -35,6 +39,8 @@ export type PlayerCopy = {
     cameraOff: string
     partner: string
     codePlaceholder: string
+    pick: string
+    joined: string
   }
   turn: {
     me: string
@@ -48,26 +54,36 @@ export type PlayerCopy = {
     micBlockedHint: string
     copyLink: string
     linkCopied: string
+    rateQuestion: string
+    voteUp: string
+    voteDown: string
+    physical: string
+    physicalPartner: string
   }
-  review: {
-    title: string
-    hint: string
-    typeHint: string
-    transcribing: string
-    failed: string
-    retry: string
-    saving: string
-  }
+  typing: {title: string; hint: string; saving: string}
   feedback: {title: string; rating: string; text: string; send: string; thanks: string}
   notices: Record<DeviceNotice, string>
+  answers: {
+    savingOne: string
+    /** `{n}` is how many answers are still on their way. */
+    savingMany: string
+    failed: string
+  }
   mine: {
     title: string
     empty: string
+    processing: string
+    failed: string
+    retry: string
+    edit: string
+    save: string
+    cancel: string
     delete: string
     confirmDelete: string
     notJoined: string
     back: string
     link: string
+    physical: string
   }
   screen: {
     joinAt: string
@@ -76,6 +92,9 @@ export type PlayerCopy = {
     starting: string
     ended: string
     noCode: string
+    orVisit: string
+    code: string
+    howTo: {title: string; steps: string[]; physicalStep: string}
     counts: {joined: string; paired: string; talking: string; done: string}
   }
 }
@@ -90,12 +109,17 @@ const en: PlayerCopy = {
     code: 'Game code',
     next: 'Next',
     hostedBy: 'Hosted by',
+    standby: "You're joining as a facilitator on standby",
   },
   consent: {
     title: 'Before you play',
-    transcript: 'Record my answers so I can save the text',
-    transcriptHint: 'You read every answer before it is saved. Audio is not kept.',
-    recap: 'Email me a recap tonight',
+    transcript: 'Record my answers and save them as text',
+    transcriptHint:
+      'Your answers are turned into text and saved automatically. Edit or delete them any time in My answers. Audio is not kept.',
+    typed: 'Let me save my typed answers',
+    typedHint: 'Nothing is kept until you tap Save.',
+    later: 'If the host turns on answers later, let me save mine',
+    recap: 'Email me a recap, and my questions to revisit later',
     email: 'Email',
     play: "Let's play",
     decline: 'Play without recording',
@@ -107,8 +131,8 @@ const en: PlayerCopy = {
       'WhoCards is responsible for your data.',
       'The workshop host sees only who joined, not your answers.',
       'If you record, OpenAI turns your audio into text for us. The audio is not kept.',
-      'An answer is stored only when you tap Save. Delete it any time in My answers.',
-      'Your email is used only for the recap.',
+      'Recorded answers are saved as text automatically; typed answers when you tap Save. Edit or delete them any time in My answers.',
+      'Your email is used only for the recap and one follow-up with your questions.',
       'Answers and recap emails are deleted 90 days after the workshop.',
       'Questions or deletion requests: hello@whocards.cc',
     ],
@@ -118,11 +142,13 @@ const en: PlayerCopy = {
     myCode: 'Your code',
     scan: 'Scan their code',
     stopScan: 'Stop scanning',
-    typeCode: 'Or type their code',
+    typeCode: 'Their code or name',
     notACode: "That's not a player code",
-    cameraOff: 'No camera. Type their code instead',
+    cameraOff: 'No camera. Type their code or name instead',
     partner: 'Talking with',
-    codePlaceholder: 'ABC234',
+    codePlaceholder: 'ABC234 or Anna',
+    pick: 'Which one?',
+    joined: 'joined',
   },
   turn: {
     me: 'You',
@@ -137,16 +163,13 @@ const en: PlayerCopy = {
       "This browser won't let the game use your mic, so this answer can't be saved. Talk anyway, then tap Done.",
     copyLink: 'Copy link',
     linkCopied: 'Link copied',
+    rateQuestion: 'Rate this question',
+    voteUp: 'Good question',
+    voteDown: 'Not a good question',
+    physical: 'Draw a card from the deck and read it out',
+    physicalPartner: 'They draw a card from the deck',
   },
-  review: {
-    title: 'Your answer',
-    hint: 'Fix anything before you save',
-    typeHint: 'Type your answer',
-    transcribing: 'Turning speech into text',
-    failed: "Couldn't turn your answer into text",
-    retry: 'Try again',
-    saving: 'Saving',
-  },
+  typing: {title: 'Your answer', hint: 'Type your answer', saving: 'Saving'},
   feedback: {
     title: 'How was it?',
     rating: 'Rate the game',
@@ -158,14 +181,26 @@ const en: PlayerCopy = {
     keep_screen_on: 'Keep your screen on',
     network: 'Connection trouble. Try again',
   },
+  answers: {
+    savingOne: 'Saving your answer',
+    savingMany: 'Saving {n} answers',
+    failed: "An answer couldn't be saved",
+  },
   mine: {
     title: 'My answers',
     empty: 'No saved answers yet',
+    processing: 'Turning your answer into text',
+    failed: "Couldn't save this answer",
+    retry: 'Try again',
+    edit: 'Edit',
+    save: 'Save',
+    cancel: 'Cancel',
     delete: 'Delete',
     confirmDelete: 'Tap again to delete',
     notJoined: 'Join a game first',
     back: 'Back to the game',
     link: 'My answers',
+    physical: 'Physical card',
   },
   screen: {
     joinAt: 'Scan to join',
@@ -174,6 +209,17 @@ const en: PlayerCopy = {
     starting: 'Starting soon',
     ended: 'Thanks for playing',
     noCode: 'Add ?code=GAMECODE to the address',
+    orVisit: 'or go to',
+    code: 'Game code',
+    howTo: {
+      title: 'How to play',
+      steps: [
+        'Join on your phone',
+        'Find someone new and scan their code, or type their name',
+        'Take turns answering the question',
+      ],
+      physicalStep: 'Draw a card and take turns answering',
+    },
     counts: {joined: 'joined', paired: 'paired', talking: 'talking', done: 'done'},
   },
 }

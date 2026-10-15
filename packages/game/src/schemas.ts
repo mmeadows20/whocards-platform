@@ -29,6 +29,11 @@ export const customQuestionSchema = z.object({
 })
 export type CustomQuestion = z.infer<typeof customQuestionSchema>
 
+/** `game_round.deck_slug` of a physical-cards round; names no deck. */
+export const PHYSICAL_SOURCE = 'physical'
+/** `game_turn.question_id` of a physical-cards turn: the question is on a card in the room. */
+export const PHYSICAL_QUESTION_ID = `${PHYSICAL_SOURCE}:card`
+
 /** A custom question id (`c:<id>`) or a deck question (`<deckSlug>:<id>`). */
 export const questionRefSchema = z.string().regex(/^[a-z0-9-]+:[^:]+$/)
 export type QuestionRef = z.infer<typeof questionRefSchema>
@@ -41,6 +46,7 @@ export const questionPlanSchema = z.discriminatedUnion('mode', [
     mode: z.literal('per-turn'),
     questions: z.tuple([questionRefSchema, questionRefSchema]),
   }),
+  z.object({mode: z.literal('physical')}),
 ])
 export type QuestionPlan = z.infer<typeof questionPlanSchema>
 
@@ -70,6 +76,10 @@ export const gameSettingsSchema = z.object({
   organizer: organizerSchema.optional(),
   questions: z.array(customQuestionSchema).max(100).optional(),
   answerModes: answerModeLogSchema.optional(),
+  // Secret in the host's facilitator link; joining with it puts the player on standby.
+  standbyKey: z.string().min(16).optional(),
+  /** Player ids of facilitators on standby for the odd player out. */
+  standby: z.array(z.string()).optional(),
 })
 export type GameSettings = z.infer<typeof gameSettingsSchema>
 
@@ -99,6 +109,12 @@ export const refusalSchema = z.enum([
   'not_found',
   'wrong_answer_mode',
   'no_consent',
+  'standby_partner',
+  'standby_key',
+  'unknown_name',
+  'ambiguous_name',
+  'still_answering',
+  'physical_card',
 ])
 export type Refusal = z.infer<typeof refusalSchema>
 
@@ -111,20 +127,36 @@ export const joinInputSchema = z.object({
   email: z.string().trim().email().optional(),
   consentTranscript: z.boolean().default(false),
   consentRecap: z.boolean().default(false),
+  standbyKey: z.string().trim().min(1).max(64).optional(),
 })
 export type JoinInput = z.input<typeof joinInputSchema>
 
 export const screenInputSchema = z.object({code: codeSchema})
 
-export const pairInputSchema = z.object({partnerCode: codeSchema})
+/** A scanned code, a pick from the name list, or typed text that is a pair code or a name. */
+export const pairInputSchema = z.union([
+  z.object({partnerCode: codeSchema}),
+  z.object({partnerId: z.string().min(1)}),
+  z.object({partner: z.string().trim().min(1).max(40)}),
+])
+export type PairInput = z.input<typeof pairInputSchema>
+
+export const pairCandidatesInputSchema = z.object({partner: z.string().trim().min(1).max(40)})
+
+/** Non-secret details that tell namesakes apart in the pick list. */
+export type PairCandidate = {id: string; name: string; language: GameLanguage; joinedAt: number}
 
 export const turnInputSchema = z.object({action: z.enum(['claim', 'finish'])})
+
+export const MAX_TRANSCRIPT_CHARS = 20_000
+const transcriptTextSchema = z.string().trim().min(1).max(MAX_TRANSCRIPT_CHARS)
+const durationMsSchema = z.number().int().min(0).max(3_600_000)
 
 export const responseInputSchema = z.object({
   turnId: z.string().min(1),
   language: gameLanguageSchema,
-  transcript: z.string().trim().min(1).max(20_000),
-  durationMs: z.number().int().min(0).max(3_600_000),
+  transcript: transcriptTextSchema,
+  durationMs: durationMsSchema,
   // Saving is the player's explicit yes; the client must say so.
   consent: z.literal(true),
 })
@@ -134,12 +166,32 @@ export const feedbackInputSchema = z.object({
   text: z.string().trim().max(2000).optional(),
 })
 
+/** A player's thumb on their own question: up, down, or null to clear it. */
+export const questionVoteSchema = z.union([z.literal(1), z.literal(-1)])
+export type QuestionVote = z.infer<typeof questionVoteSchema>
+
+export const voteInputSchema = z.object({
+  turnId: z.string().min(1),
+  vote: questionVoteSchema.nullable(),
+})
+
 export const deleteResponseInputSchema = z.object({responseId: z.string().min(1)})
 
-export const transcribeFieldsSchema = z.object({
-  token: z.string().min(1),
-  language: gameLanguageSchema,
+export const editResponseInputSchema = z.object({
+  responseId: z.string().min(1),
+  transcript: transcriptTextSchema,
 })
+
+/** Multipart text fields of a recorded-answer upload, beside the `audio` file. */
+export const answerUploadFieldsSchema = z.object({
+  token: z.string().min(1),
+  turnId: z.string().min(1),
+  durationMs: z.coerce.number().pipe(durationMsSchema),
+})
+
+/** What the answer upload returns; `saved: false` means the take had no words in it. */
+export const answerUploadResultSchema = z.object({saved: z.boolean()})
+export type AnswerUploadResult = z.infer<typeof answerUploadResultSchema>
 
 // ---------- outputs (timestamps are epoch ms) ----------
 
@@ -148,6 +200,8 @@ export const roundViewSchema = z.object({
   n: z.number().int(),
   status: roundStatusSchema,
   deckSlug: z.string(),
+  /** Questions come from a physical deck in the room, not the app. */
+  physical: z.boolean(),
   turnSeconds: z.number().int(),
   oddRule: oddRuleSchema,
   overtime: overtimeSchema,
@@ -167,6 +221,8 @@ export const turnViewSchema = z.object({
   finishedAt: z.number().nullable(),
   /** Server stops the turn at this instant if nobody taps Finish. */
   deadline: z.number(),
+  /** Only ever set on my own turns. */
+  questionVote: questionVoteSchema.nullable(),
 })
 export type TurnView = z.infer<typeof turnViewSchema>
 
@@ -174,6 +230,8 @@ export type TurnView = z.infer<typeof turnViewSchema>
 export const playerPhaseSchema = z.enum([
   'waiting', // no live round
   'unpaired',
+  'find_facilitator', // odd one out while a facilitator is on standby
+  'standby', // facilitator waiting for an odd one out
   'sitting_out',
   'ready', // paired, my turn available
   'speaking',
@@ -221,6 +279,7 @@ export const screenStateSchema = z.object({
     title: z.string(),
     organizer: z.string().nullable(),
     status: gameStatusSchema,
+    answerMode: answerModeSchema,
   }),
   round: roundViewSchema.nullable(),
   counts: z.object({

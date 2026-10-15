@@ -6,10 +6,12 @@ import {useEffect, useState} from 'react'
 import {cn} from '~utils/cn'
 
 import {noticeText} from './notices'
-import {Button, inputClass, Notice, Screen} from './ui'
+import {Button, choiceClass, inputClass, Notice, Screen} from './ui'
 
 type JoinProps = {
   initialCode: string
+  /** From the host's facilitator link; joins this player on standby. */
+  standbyKey?: string
   onJoin: (input: JoinInput, records: boolean) => Promise<GameError | null>
   /** The public projector view of a game code: its title, organizer and whether it's open. */
   lookup: (code: string) => Promise<ScreenState>
@@ -45,7 +47,7 @@ const useWorkshop = (code: string, lookup: JoinProps['lookup']): Workshop | null
   return found && found.code === valid ? found : null
 }
 
-export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
+export const Join = ({initialCode, standbyKey, onJoin, lookup}: JoinProps) => {
   const [step, setStep] = useState<'details' | 'consent'>('details')
   const [name, setName] = useState('')
   const [language, setLanguage] = useState<GameLanguage>('en')
@@ -53,7 +55,7 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
   const [transcript, setTranscript] = useState(true)
   const [recap, setRecap] = useState(false)
   const [email, setEmail] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [busy, setBusy] = useState<'play' | 'decline' | null>(null)
   const [failure, setFailure] = useState<GameError | null>(null)
   const copy = playerCopyFor(language)
   const workshop = useWorkshop(code, lookup)
@@ -69,15 +71,18 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
     email: recap && email.trim() ? email.trim() : undefined,
     consentTranscript: records,
     consentRecap: recap,
+    standbyKey,
   })
   const detailsReady = name.trim() !== '' && readPairCode(code) !== null
+  // Lookup can fail, so an unknown mode keeps the full voice consent.
+  const mode = workshop?.answerMode ?? 'voice'
   const consentReady =
     joinInputSchema.safeParse(input(transcript)).success && (!recap || email.trim() !== '')
 
   const submit = async (records: boolean) => {
-    setBusy(true)
+    setBusy(records ? 'play' : 'decline')
     const result = await onJoin(input(records), records)
-    setBusy(false)
+    setBusy(null)
     setFailure(result)
     if (result?.refusal === 'unknown_game') setStep('details')
   }
@@ -85,7 +90,13 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
   if (step === 'details')
     return (
       <Screen title={copy.join.title}>
-        {workshop && <WorkshopHeading workshop={workshop} hostedBy={copy.join.hostedBy} />}
+        {readPairCode(code) && (
+          // Holds the heading's space while the lookup runs, so the form doesn't drop.
+          <div className='min-h-12'>
+            {workshop && <WorkshopHeading workshop={workshop} hostedBy={copy.join.hostedBy} />}
+          </div>
+        )}
+        {standbyKey && <p className='text-center font-semibold'>{copy.join.standby}</p>}
         <form
           className='flex w-full flex-col gap-4'
           onSubmit={(event) => {
@@ -112,12 +123,7 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
                   key={option}
                   type='button'
                   aria-pressed={language === option}
-                  className={cn(
-                    'h-12 rounded-full border text-lg',
-                    language === option
-                      ? 'bg-darkest text-primary-light border-darkest'
-                      : 'border-darkest/20'
-                  )}
+                  className={cn('h-12', choiceClass(language === option))}
                   onClick={() => setLanguage(option)}
                 >
                   {copy.join.languages[option]}
@@ -149,19 +155,25 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
       <label className='flex w-full items-start gap-3'>
         <input
           type='checkbox'
-          className='checkbox mt-1'
+          className='mt-1 size-5 shrink-0 accent-yellow-400'
           checked={transcript}
           onChange={(event) => setTranscript(event.target.checked)}
         />
-        <span>
-          {copy.consent.transcript}
-          <span className='text-mutedOnLight block text-sm'>{copy.consent.transcriptHint}</span>
-        </span>
+        {mode === 'none' ? (
+          <span>{copy.consent.later}</span>
+        ) : (
+          <span>
+            {mode === 'type' ? copy.consent.typed : copy.consent.transcript}
+            <span className='text-gray-dark block text-sm'>
+              {mode === 'type' ? copy.consent.typedHint : copy.consent.transcriptHint}
+            </span>
+          </span>
+        )}
       </label>
       <label className='flex w-full items-start gap-3'>
         <input
           type='checkbox'
-          className='checkbox mt-1'
+          className='mt-1 size-5 shrink-0 accent-yellow-400'
           checked={recap}
           onChange={(event) => setRecap(event.target.checked)}
         />
@@ -181,19 +193,29 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
       )}
       <Privacy language={language} />
       {shown && <Notice>{noticeText(language, shown)}</Notice>}
-      <Button disabled={busy || !consentReady} onClick={() => void submit(transcript)}>
+      <Button
+        pending={busy === (transcript ? 'play' : 'decline')}
+        disabled={busy !== null || !consentReady}
+        onClick={() => void submit(transcript)}
+      >
         {copy.consent.play}
       </Button>
-      {transcript && (
+      {mode === 'voice' && transcript && (
         <Button
           variant='ghost'
-          disabled={busy || !joinInputSchema.safeParse(input(false)).success}
+          pending={busy === 'decline'}
+          disabled={busy !== null || !joinInputSchema.safeParse(input(false)).success}
           onClick={() => void submit(false)}
         >
           {copy.consent.decline}
         </Button>
       )}
-      <button type='button' className='underline' onClick={() => setStep('details')}>
+      <button
+        type='button'
+        disabled={busy !== null}
+        className='text-gray-lighter cursor-pointer underline underline-offset-4 disabled:opacity-50'
+        onClick={() => setStep('details')}
+      >
         {copy.consent.back}
       </button>
     </Screen>
@@ -202,9 +224,9 @@ export const Join = ({initialCode, onJoin, lookup}: JoinProps) => {
 
 const WorkshopHeading = ({workshop, hostedBy}: {workshop: Workshop; hostedBy: string}) => (
   <div className='text-center'>
-    <p className='text-xl font-semibold'>{workshop.title}</p>
+    <p className='font-title text-xl font-bold text-yellow-300'>{workshop.title}</p>
     {workshop.organizer && (
-      <p className='text-mutedOnLight text-sm'>
+      <p className='text-gray-dark text-sm'>
         {hostedBy} {workshop.organizer}
       </p>
     )}
@@ -214,8 +236,8 @@ const WorkshopHeading = ({workshop, hostedBy}: {workshop: Workshop; hostedBy: st
 const Privacy = ({language}: {language: GameLanguage}) => {
   const {privacy} = playerCopyFor(language)
   return (
-    <section className='w-full rounded-2xl bg-white/60 px-4 py-3 text-sm'>
-      <h2 className='font-semibold'>{privacy.title}</h2>
+    <section className='text-gray-lighter w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm'>
+      <h2 className='font-semibold text-white'>{privacy.title}</h2>
       <ul className='mt-2 flex list-disc flex-col gap-1 pl-4'>
         {privacy.lines.map((line) => (
           <li key={line}>{line}</li>

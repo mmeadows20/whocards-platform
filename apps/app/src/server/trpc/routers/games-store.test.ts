@@ -2,7 +2,16 @@ import {PGlite} from '@electric-sql/pglite'
 import {answerModeAt} from '@whocards/game'
 import type {QuestionPlan} from '@whocards/game'
 import * as gameSchema from '@whocards/game/db'
-import {hostedGame} from '@whocards/game/db'
+import {
+  gameFeedback,
+  gamePair,
+  gamePairPlayer,
+  gamePlayer,
+  gameResponse,
+  gameRound,
+  gameTurn,
+  hostedGame,
+} from '@whocards/game/db'
 import {generateDrizzleJson, generateMigration} from 'drizzle-kit/api'
 import {eq, sql} from 'drizzle-orm'
 import {drizzle} from 'drizzle-orm/pglite'
@@ -10,7 +19,7 @@ import {beforeAll, beforeEach, describe, expect, it} from 'vitest'
 
 import {appMember, appOrganization, appUser} from '~/server/db/schema'
 import {createDrizzleHostStore} from './games-store'
-import {readRecapState} from './games-logic'
+import {readSendState} from './games-logic'
 
 const client = new PGlite()
 const db = drizzle(client)
@@ -18,9 +27,9 @@ const store = createDrizzleHostStore(db)
 let gameId = ''
 
 const claim = (sentAt: number) => ({sentAt, sent: 0, failed: 0, error: null, pending: true})
-const recapOf = async () => {
+const stateOf = async (mailing: 'recap' | 'revisit') => {
   const [row] = await db.select().from(hostedGame).where(eq(hostedGame.id, gameId))
-  return readRecapState(row?.settings)
+  return readSendState(row?.settings, mailing)
 }
 
 beforeAll(async () => {
@@ -66,22 +75,43 @@ describe('drizzle host store conditional writes', () => {
   })
 
   it('lets one claim through, keeps settings, and reopens only a send that delivered nothing', async () => {
-    expect(await store.claimRecap(gameId, claim(1))).toBe(false)
+    expect(await store.claimSend(gameId, 'recap', claim(1))).toBe(false)
     await store.endGame({gameId, endedAt: 1})
 
     expect(
-      await Promise.all([store.claimRecap(gameId, claim(2)), store.claimRecap(gameId, claim(3))])
+      await Promise.all([
+        store.claimSend(gameId, 'recap', claim(2)),
+        store.claimSend(gameId, 'recap', claim(3)),
+      ])
     ).toEqual([true, false])
-    expect(await store.claimRecap(gameId, claim(4))).toBe(false)
+    expect(await store.claimSend(gameId, 'recap', claim(4))).toBe(false)
 
-    await store.saveRecapState(gameId, {...claim(2), failed: 3, error: 'down', pending: false})
-    expect(await store.claimRecap(gameId, claim(5))).toBe(true)
-    await store.saveRecapState(gameId, {...claim(5), sent: 3, pending: false})
-    expect(await store.claimRecap(gameId, claim(6))).toBe(false)
+    await store.saveSendState(gameId, 'recap', {
+      ...claim(2),
+      failed: 3,
+      error: 'down',
+      pending: false,
+    })
+    expect(await store.claimSend(gameId, 'recap', claim(5))).toBe(true)
+    await store.saveSendState(gameId, 'recap', {...claim(5), sent: 3, pending: false})
+    expect(await store.claimSend(gameId, 'recap', claim(6))).toBe(false)
 
-    expect(await recapOf()).toMatchObject({sentAt: 5, sent: 3, pending: false})
+    expect(await stateOf('recap')).toMatchObject({sentAt: 5, sent: 3, pending: false})
     const snapshot = await store.loadSnapshot(gameId)
     expect(snapshot?.game.settings).toMatchObject({round: {}, organizer: 'SDD Conf'})
+  })
+
+  it('claims each mailing on its own, so a sent recap leaves the revisit email open', async () => {
+    await store.endGame({gameId, endedAt: 1})
+    expect(await store.claimSend(gameId, 'recap', claim(1))).toBe(true)
+    await store.saveSendState(gameId, 'recap', {...claim(1), sent: 2, pending: false})
+
+    expect(await store.claimSend(gameId, 'revisit', claim(2))).toBe(true)
+    expect(await store.claimSend(gameId, 'revisit', claim(3))).toBe(false)
+    await store.saveSendState(gameId, 'revisit', {...claim(2), sent: 2, pending: false})
+
+    expect(await stateOf('recap')).toMatchObject({sentAt: 1, sent: 2})
+    expect(await stateOf('revisit')).toMatchObject({sentAt: 2, sent: 2, pending: false})
   })
 
   it('saves custom questions and round plans without touching other settings', async () => {
@@ -105,6 +135,16 @@ describe('drizzle host store conditional writes', () => {
       questions: [{id: 'c:aaaa', en: 'A?', hu: 'Á?'}],
     })
     expect(snapshot?.rounds[0]).toMatchObject({deckSlug: 'custom', questionPlan: plan})
+  })
+
+  it('keeps the first standby key and the other settings', async () => {
+    await store.ensureStandbyKey(gameId, 'first-key-0123456789')
+    await store.ensureStandbyKey(gameId, 'second-key-0123456789')
+    const snapshot = await store.loadSnapshot(gameId)
+    expect(snapshot?.game.settings).toMatchObject({
+      organizer: 'SDD Conf',
+      standbyKey: 'first-key-0123456789',
+    })
   })
 
   it('stamps answer-mode switches with the database clock, which also stamps turn starts', async () => {
@@ -183,5 +223,93 @@ describe('drizzle host store conditional writes', () => {
       {id: 'u-tamas', label: 'Tamas'},
       {id: 'u-avi', label: 'Avi'},
     ])
+  })
+
+  it('copies a game and its rounds in one go, under a new code', async () => {
+    const copy = await store.copyGame({
+      title: 'SDD (copy)',
+      createdBy: 'u-tamas',
+      settings: {round: {}, organizer: 'SDD Conf', answerModes: [{mode: 'type', at: 0}]},
+      facilitators: ['u-avi'],
+      rounds: [
+        {
+          n: 1,
+          questionPlan: {mode: 'random', source: 'library'},
+          deckSlug: 'library',
+          turnSeconds: 60,
+          oddRule: 'trio',
+          overtime: 'nudge',
+          overtimeSeconds: 30,
+        },
+      ],
+    })
+    expect(copy).toMatchObject({title: 'SDD (copy)', status: 'lobby'})
+    expect(await store.hostsOf(copy.id)).toEqual({createdBy: 'u-tamas', facilitators: ['u-avi']})
+    const snapshot = await store.loadSnapshot(copy.id)
+    expect(snapshot?.rounds).toMatchObject([{n: 1, status: 'pending', turnSeconds: 60}])
+    expect(snapshot?.game.code).not.toBe((await store.loadSnapshot(gameId))?.game.code)
+  })
+
+  it('deletes a game with every row under it, but never while live', async () => {
+    await store.goLive(gameId)
+    await store.addRound({
+      questionPlan: {mode: 'random', source: 'library'},
+      deckSlug: 'library',
+      turnSeconds: 60,
+      oddRule: 'trio',
+      overtime: 'nudge',
+      overtimeSeconds: 30,
+      gameId,
+      n: 1,
+    })
+    const [round] = await db.select().from(gameRound)
+    const players = await db
+      .insert(gamePlayer)
+      .values(
+        ['A', 'B'].map((name) => ({
+          gameId,
+          name,
+          language: 'en' as const,
+          tokenHash: `t-${name}`,
+          pairCode: `P${name}`,
+        }))
+      )
+      .returning()
+    const [pair] = await db.insert(gamePair).values({roundId: round!.id}).returning()
+    await db
+      .insert(gamePairPlayer)
+      .values(
+        players.map((p, slot) => ({pairId: pair!.id, roundId: round!.id, playerId: p.id, slot}))
+      )
+    const [turn] = await db
+      .insert(gameTurn)
+      .values({pairId: pair!.id, playerId: players[0]!.id, questionId: '1', startedAt: new Date()})
+      .returning()
+    await db.insert(gameResponse).values({
+      turnId: turn!.id,
+      playerId: players[0]!.id,
+      language: 'en',
+      transcript: 'hi',
+      durationMs: 1000,
+    })
+    await db.insert(gameFeedback).values({gameId, playerId: players[1]!.id, rating: 5})
+
+    expect(await store.deleteGame(gameId)).toBe(false)
+    await store.endGame({gameId, endedAt: 1})
+    expect(await store.deleteGame(gameId)).toBe(true)
+    expect(await store.deleteGame(gameId)).toBe(false)
+
+    const tables = [
+      hostedGame,
+      gamePlayer,
+      gameRound,
+      gamePair,
+      gamePairPlayer,
+      gameTurn,
+      gameResponse,
+      gameFeedback,
+    ]
+    const counts = await Promise.all(tables.map((t) => db.$count(t)))
+    expect(counts).toEqual([0, 0, 0, 0, 0, 0, 0, 0])
   })
 })

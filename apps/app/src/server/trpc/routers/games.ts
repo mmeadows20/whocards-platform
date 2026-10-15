@@ -21,9 +21,10 @@ import {
   roundView,
   samePlan,
   screenView,
+  standbyIds,
   turnRef,
 } from '@whocards/game'
-import type {GameRecapProps} from '@whocards/emails'
+import type {GameRecapProps, GameRevisitProps} from '@whocards/emails'
 import type {
   AnswerMode,
   CustomQuestion,
@@ -36,6 +37,7 @@ import type {
   QuestionSources,
   RoundSettings,
   RoundView,
+  ScreenState,
 } from '@whocards/game'
 import {z} from 'zod'
 
@@ -43,15 +45,18 @@ import {roleAtLeast} from '../../auth/permissions'
 import {createTRPCRouter, roleProcedure} from '../trpc'
 import {
   buildRecaps,
+  buildRevisits,
+  copyOf,
   GAMES_MIN_ROLE,
   hostAccess,
   organizerOf,
   plannedRoundEnd,
   previewRecap,
-  readRecapState,
+  previewRevisit,
+  readSendState,
   strandedByRemoval,
 } from './games-logic'
-import type {GameHosts, Recap, RecapState} from './games-logic'
+import type {GameCopy, GameHosts, Mailing, Recap, Revisit, SendState} from './games-logic'
 
 export type WriteResult = 'ok' | 'conflict' | 'stale'
 
@@ -65,6 +70,7 @@ export type GameSummary = {
   organizer: string | null
   /** The creator's label; null if that account is gone. */
   createdBy: string | null
+  createdById: string | null
   /** Co-facilitator labels. */
   facilitators: string[]
   status: GameStatus
@@ -80,6 +86,10 @@ export type HostStore = {
   /** Newest first; games `userId` created or co-facilitates, or every game when null. */
   listGames: (userId: string | null) => Promise<GameSummary[]>
   createGame: (input: {title: string; organizer: string; createdBy: string}) => Promise<HostedGame>
+  /** Inserts a draft game and its pending rounds atomically. */
+  copyGame: (input: GameCopy & {createdBy: string}) => Promise<HostedGame>
+  /** Deletes a game that is not live, with everything under it; false if it was live or gone. */
+  deleteGame: (gameId: string) => Promise<boolean>
   /** The creator and co-facilitator ids; null when there is no such game. */
   hostsOf: (gameId: string) => Promise<GameHosts | null>
   /** Labels for these user ids, in the given order, skipping unknown ones. */
@@ -104,6 +114,8 @@ export type HostStore = {
   }) => Promise<WriteResult>
   /** Appends to `hosted_game.settings.answerModes` while the game has not ended, stamped by the database clock. */
   setAnswerMode: (input: {gameId: string; mode: AnswerMode}) => Promise<WriteResult>
+  /** Sets `hosted_game.settings.standbyKey` unless one is already there. */
+  ensureStandbyKey: (gameId: string, key: string) => Promise<void>
   /** Replaces `hosted_game.settings.questions`. */
   saveQuestions: (gameId: string, questions: CustomQuestion[]) => Promise<void>
   /** Pending round to live in a live game; 'conflict' when another round is live, 'stale' when the game or round moved on. */
@@ -117,9 +129,9 @@ export type HostStore = {
   endRound: (input: {roundId: string; endedAt: number}) => Promise<WriteResult>
   /** Ends the live round, its open turns and the game atomically. */
   endGame: (input: {gameId: string; endedAt: number}) => Promise<void>
-  /** Stores `claim` only if the ended game has no recap yet, or one that sent nothing; true for the one caller that gets to send. */
-  claimRecap: (gameId: string, claim: RecapState) => Promise<boolean>
-  saveRecapState: (gameId: string, recap: RecapState) => Promise<void>
+  /** Stores `claim` only if the ended game has no such send yet, or one that sent nothing; true for the one caller that gets to send. */
+  claimSend: (gameId: string, mailing: Mailing, claim: SendState) => Promise<boolean>
+  saveSendState: (gameId: string, mailing: Mailing, state: SendState) => Promise<void>
   /** Deletes the player; `release` frees partners stranded in this round's pair so they can re-pair. */
   removePlayer: (input: {
     gameId: string
@@ -131,8 +143,11 @@ export type HostStore = {
 /** Round settings as stored: the plan plus the `deck_slug` derived from it. */
 export type RoundRecord = RoundSettings & {deckSlug: string}
 
-export type SendRecaps = (recaps: Recap[]) => Promise<Pick<RecapState, 'sent' | 'failed' | 'error'>>
+export type SendResult = Pick<SendState, 'sent' | 'failed' | 'error'>
+export type SendRecaps = (recaps: Recap[]) => Promise<SendResult>
 export type RenderRecap = (props: GameRecapProps) => Promise<string>
+export type SendRevisits = (revisits: Revisit[]) => Promise<SendResult>
+export type RenderRevisit = (props: GameRevisitProps) => Promise<string>
 
 const gameIdSchema = z.object({gameId: z.string().uuid()})
 const roundIdSchema = gameIdSchema.extend({roundId: z.string().uuid()})
@@ -193,16 +208,28 @@ export type GameDetail = {
     status: GameStatus
     /** How the next claimed turn is answered. */
     answerMode: AnswerMode
-    recap: RecapState | null
+    recap: SendState | null
+    /** The optional "revisit your questions" email, sent after the recap. */
+    revisit: SendState | null
+    /** Secret for the facilitator standby join link; null until a host asks for one. */
+    standbyKey: string | null
   }
   questions: Array<CustomQuestion & {used: boolean}>
-  players: Array<{id: string; name: string; language: GameLanguage; recap: boolean}>
+  players: Array<{
+    id: string
+    name: string
+    language: GameLanguage
+    recap: boolean
+    standby: boolean
+  }>
   /** `picks` is the English text of a same/per-turn round's fixed questions. */
   rounds: Array<
     RoundView & {pairs: number; turns: number; questionPlan: QuestionPlan; picks: string[]}
   >
   liveRoundId: string | null
   counts: {players: number; pairs: number; turnsInProgress: number; responses: number}
+  /** The public projector's counts, for the host's projector mode. */
+  room: ScreenState['counts']
 }
 
 type Hosting = Pick<GameDetail['game'], 'createdBy' | 'facilitators' | 'canManageHosts'>
@@ -217,6 +244,7 @@ const detailOf = (
   const round = currentRound(snapshot)
   const sources = sourcesOf(snapshot)
   const used = refsInUse(snapshot)
+  const standby = standbyIds(snapshot)
   const pairsByRound = new Map<string, number>()
   for (const pair of snapshot.pairs) {
     pairsByRound.set(pair.roundId, (pairsByRound.get(pair.roundId) ?? 0) + 1)
@@ -231,7 +259,9 @@ const detailOf = (
       ...hosting,
       status: snapshot.game.status,
       answerMode: currentAnswerMode(snapshot.game.settings),
-      recap: readRecapState(snapshot.game.settings),
+      recap: readSendState(snapshot.game.settings, 'recap'),
+      revisit: readSendState(snapshot.game.settings, 'revisit'),
+      standbyKey: snapshot.game.settings.standbyKey ?? null,
     },
     questions: sources.custom.map((q) => ({...q, used: used.has(q.id)})),
     players: snapshot.players.map((p) => ({
@@ -239,6 +269,7 @@ const detailOf = (
       name: p.name,
       language: p.language,
       recap: p.consentRecap && p.email !== null,
+      standby: standby.has(p.id),
     })),
     rounds: snapshot.rounds.map((r) => ({
       ...roundView(r),
@@ -249,11 +280,12 @@ const detailOf = (
     })),
     liveRoundId: round?.status === 'live' ? round.id : null,
     counts: {
-      players: snapshot.players.length,
+      players: screen.counts.joined,
       pairs: round ? (pairsByRound.get(round.id) ?? 0) : 0,
       turnsInProgress: screen.counts.talking,
       responses: Object.values(saved).reduce((sum, n) => sum + n, 0),
     },
+    room: screen.counts,
   }
 }
 
@@ -274,20 +306,25 @@ const conflictOr = (result: WriteResult, message: string) => {
   if (result !== 'ok') throw fail('CONFLICT', message)
 }
 
-const managing = (ctx: {canManageHosts: boolean}) => {
-  if (!ctx.canManageHosts) {
-    throw fail('FORBIDDEN', 'Only the creator or an admin can change the co-facilitators.')
-  }
+const managing = (
+  ctx: {canManageHosts: boolean},
+  message = 'Only the creator or an admin can change the co-facilitators.'
+) => {
+  if (!ctx.canManageHosts) throw fail('FORBIDDEN', message)
 }
 
 export const createGamesRouter = ({
   store,
   sendRecaps,
   renderRecap,
+  sendRevisits,
+  renderRevisit,
 }: {
   store: HostStore
   sendRecaps: SendRecaps
   renderRecap: RenderRecap
+  sendRevisits: SendRevisits
+  renderRevisit: RenderRevisit
 }) => {
   const procedure = roleProcedure(GAMES_MIN_ROLE)
 
@@ -331,6 +368,23 @@ export const createGamesRouter = ({
     return snapshot
   }
 
+  /** Sends once per game and mailing: the conditional claim lets exactly one host through. */
+  const sendOnce = async <T>(
+    gameId: string,
+    mailing: Mailing,
+    emails: T[],
+    send: (emails: T[]) => Promise<SendResult>
+  ) => {
+    const claim = {sentAt: store.now(), sent: 0, failed: 0, error: null, pending: true}
+    if (!(await store.claimSend(gameId, mailing, claim))) return
+    const result = await send(emails).catch((error: unknown) => ({
+      sent: 0,
+      failed: emails.length,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    await store.saveSendState(gameId, mailing, {...claim, ...result, pending: false})
+  }
+
   const endLiveRound = async (snapshot: GameSnapshot, roundId: string) => {
     const round = roundIn(snapshot, roundId)
     if (round.status !== 'live') throw fail('BAD_REQUEST', 'That round is not live.')
@@ -339,9 +393,15 @@ export const createGamesRouter = ({
   }
 
   return createTRPCRouter({
-    list: procedure.query(({ctx}) =>
-      store.listGames(roleAtLeast(ctx.membership.role, 'admin') ? null : ctx.user.id)
-    ),
+    /** `canManage`: the caller may delete the game, as with changing its co-facilitators. */
+    list: procedure.query(async ({ctx}) => {
+      const user = {id: ctx.user.id, role: ctx.membership.role}
+      const games = await store.listGames(roleAtLeast(user.role, 'admin') ? null : user.id)
+      return games.map((g) => ({
+        ...g,
+        canManage: hostAccess({createdBy: g.createdById, facilitators: []}, user) === 'manage',
+      }))
+    }),
 
     decks: procedure.query(() =>
       getAllDecks().map((d) => ({
@@ -447,6 +507,14 @@ export const createGamesRouter = ({
         return detail(input.gameId, ctx)
       }),
 
+    /** Mints the facilitator standby key once; later calls keep the first. */
+    enableStandby: gameProcedure.input(gameIdSchema).mutation(async ({ctx, input}) => {
+      const snapshot = await load(input.gameId)
+      if (snapshot.game.status === 'ended') throw fail('BAD_REQUEST', 'The game is over.')
+      await store.ensureStandbyKey(input.gameId, crypto.randomUUID().replaceAll('-', ''))
+      return detail(input.gameId, ctx)
+    }),
+
     /** Replaces the game's custom question list; ids stay put so turns keep their text. */
     saveQuestions: gameProcedure
       .input(
@@ -548,7 +616,6 @@ export const createGamesRouter = ({
       }
     }),
 
-    /** Sends once per game: the conditional claim lets exactly one host through. */
     sendRecaps: gameProcedure.input(gameIdSchema).mutation(async ({ctx, input}) => {
       const [snapshot, saved] = await Promise.all([
         loadEnded(input.gameId),
@@ -561,16 +628,41 @@ export const createGamesRouter = ({
         random: store.random,
       })
       if (recaps.length === 0) throw fail('BAD_REQUEST', 'Nobody asked for a recap.')
-      const claim = {sentAt: store.now(), sent: 0, failed: 0, error: null, pending: true}
-      if (!(await store.claimRecap(input.gameId, claim))) return detail(input.gameId, ctx)
-
-      const result = await sendRecaps(recaps).catch((error: unknown) => ({
-        sent: 0,
-        failed: recaps.length,
-        error: error instanceof Error ? error.message : String(error),
-      }))
-      await store.saveRecapState(input.gameId, {...claim, ...result, pending: false})
+      await sendOnce(input.gameId, 'recap', recaps, sendRecaps)
       return detail(input.gameId, ctx)
+    }),
+
+    revisitPreview: gameProcedure.input(gameIdSchema).query(async ({input}) => {
+      const preview = previewRevisit(await loadEnded(input.gameId))
+      return {
+        recipients: preview.recipients,
+        sample: preview.sample,
+        html: await renderRevisit(preview.props),
+      }
+    }),
+
+    sendRevisits: gameProcedure.input(gameIdSchema).mutation(async ({ctx, input}) => {
+      const revisits = buildRevisits(await loadEnded(input.gameId))
+      if (revisits.length === 0) throw fail('BAD_REQUEST', 'Nobody to send it to.')
+      await sendOnce(input.gameId, 'revisit', revisits, sendRevisits)
+      return detail(input.gameId, ctx)
+    }),
+
+    /** Any host may copy, in any status; the copy is theirs. */
+    copyGame: gameProcedure.input(gameIdSchema).mutation(async ({ctx, input}) => {
+      const snapshot = await load(input.gameId)
+      return store.copyGame({...copyOf(snapshot, ctx.hosts, ctx.user.id), createdBy: ctx.user.id})
+    }),
+
+    deleteGame: gameProcedure.input(gameIdSchema).mutation(async ({ctx, input}) => {
+      managing(ctx, 'Only the creator or an admin can delete this game.')
+      const {status} = (await load(input.gameId)).game
+      if (status === 'live') throw fail('BAD_REQUEST', 'End the game first.')
+      if (!(await store.deleteGame(input.gameId))) {
+        await load(input.gameId)
+        throw fail('CONFLICT', 'The game went live meanwhile. End it first.')
+      }
+      return {deleted: true}
     }),
 
     removePlayer: gameProcedure

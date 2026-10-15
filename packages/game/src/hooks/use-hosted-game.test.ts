@@ -14,6 +14,7 @@ const makeClient = () => ({
   turn: vi.fn<GameClient['turn']>(),
   response: vi.fn<GameClient['response']>(),
   feedback: vi.fn<GameClient['feedback']>(),
+  vote: vi.fn<GameClient['vote']>(),
 })
 
 const makePlatform = () => {
@@ -107,7 +108,7 @@ describe('useHostedGame', () => {
     client.pair.mockResolvedValue(playerState({phase: 'ready'}))
     let failure: unknown = 'pending'
     await flush(async () => {
-      failure = await hook.current.act((c) => c.pair('XYZ9'))
+      failure = await hook.current.act((c) => c.pair({partnerCode: 'XYZ9'}))
     })
     expect(failure).toBeNull()
     expect(hook.current.state?.phase).toBe('ready')
@@ -123,7 +124,7 @@ describe('useHostedGame', () => {
     client.pair.mockRejectedValue(trpcError({code: 'CONFLICT', refusal: 'met_before'}))
     let refusal: unknown = null
     await flush(async () => {
-      refusal = (await hook.current.act((c) => c.pair('XYZ9')))?.refusal
+      refusal = (await hook.current.act((c) => c.pair({partnerCode: 'XYZ9'})))?.refusal
     })
     expect(refusal).toBe('met_before')
     expect(client.state).toHaveBeenCalledTimes(2)

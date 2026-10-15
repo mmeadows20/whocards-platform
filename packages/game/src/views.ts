@@ -7,8 +7,9 @@ import type {
   ScreenState,
   TurnView,
 } from './schemas'
-import {answerModeAt} from './rules/answer-mode'
-import {pairOf} from './rules/pairing'
+import {answerModeAt, currentAnswerMode} from './rules/answer-mode'
+import {pairOf, standbyIds} from './rules/pairing'
+import {planOf} from './rules/questions'
 import {currentRound} from './rules/status'
 import {deadlineOf, finishedAtOf, openTurnOf, phaseOf, turnsOf} from './rules/turns'
 
@@ -19,6 +20,7 @@ export const roundView = (round: Round): RoundView => ({
   n: round.n,
   status: round.status,
   deckSlug: round.deckSlug,
+  physical: planOf(round).mode === 'physical',
   turnSeconds: round.turnSeconds,
   oddRule: round.oddRule,
   overtime: round.overtime,
@@ -32,17 +34,18 @@ const turnView = (
   round: Round,
   turn: Turn,
   now: number,
-  language: GameLanguage,
+  viewer: {id: string; language: GameLanguage},
   resolve: ResolveQuestion
 ): TurnView => ({
   id: turn.id,
   playerId: turn.playerId,
   questionId: turn.questionId,
-  questionText: resolve(turn.questionId, language),
+  questionText: resolve(turn.questionId, viewer.language),
   answerMode: answerModeAt(settings, turn.startedAt),
   startedAt: turn.startedAt,
   finishedAt: finishedAtOf(round, turn, now),
   deadline: deadlineOf(round, turn),
+  questionVote: turn.playerId === viewer.id ? turn.questionVote : null,
 })
 
 /** Everything one phone needs to render, from that player's point of view. */
@@ -60,7 +63,7 @@ export const playerView = (
   let pairView: PlayerState['pair'] = null
   if (round && pair) {
     const turns = turnsOf(snapshot, pair.id).map((t) =>
-      turnView(snapshot.game.settings, round, t, now, me.language, resolve)
+      turnView(snapshot.game.settings, round, t, now, me, resolve)
     )
     const open = openTurnOf(round, turnsOf(snapshot, pair.id), now)
     pairView = {
@@ -92,6 +95,8 @@ export const playerView = (
 /** The big screen: counts only, no names or answers. */
 export const screenView = (snapshot: GameSnapshot, now: number): ScreenState => {
   const round = currentRound(snapshot)
+  const standby = standbyIds(snapshot)
+  const regulars = (ids: string[]) => ids.filter((id) => !standby.has(id)).length
   const pairs = round ? snapshot.pairs.filter((p) => p.roundId === round.id) : []
   let talking = 0
   let done = 0
@@ -101,7 +106,7 @@ export const screenView = (snapshot: GameSnapshot, now: number): ScreenState => 
     const spoke = new Set(
       turns.filter((t) => round && finishedAtOf(round, t, now) !== null).map((t) => t.playerId)
     )
-    if (pair.playerIds.every((id) => spoke.has(id))) done += pair.playerIds.length
+    if (pair.playerIds.every((id) => spoke.has(id))) done += regulars(pair.playerIds)
   }
   return {
     serverNow: now,
@@ -110,11 +115,12 @@ export const screenView = (snapshot: GameSnapshot, now: number): ScreenState => 
       title: snapshot.game.title,
       organizer: snapshot.game.settings.organizer ?? null,
       status: snapshot.game.status,
+      answerMode: currentAnswerMode(snapshot.game.settings),
     },
     round: round ? roundView(round) : null,
     counts: {
-      joined: snapshot.players.length,
-      paired: pairs.reduce((sum, p) => sum + p.playerIds.length, 0),
+      joined: regulars(snapshot.players.map((p) => p.id)),
+      paired: pairs.reduce((sum, p) => sum + regulars(p.playerIds), 0),
       talking,
       done,
     },

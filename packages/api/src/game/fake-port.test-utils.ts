@@ -1,3 +1,4 @@
+import {TRANSCRIPTION_CLAIM_TTL_MS} from '@whocards/game'
 import type {GameSnapshot, HostedGame, Player, ResponseRecord, Round} from '@whocards/game'
 
 import type {GamePort} from './port'
@@ -27,7 +28,7 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
   const tokens = new Map<string, string>()
   const responses: StoredResponse[] = []
   const feedback = new Map<string, {rating: number; text: string | null}>()
-  const transcribed = new Set<string>()
+  const transcribing = new Map<string, number>()
 
   const port: GamePort = {
     now: () => clock,
@@ -37,13 +38,18 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
       const id = tokens.get(token)
       return snapshot.players.find((p) => p.id === id) ?? null
     },
-    createPlayer: async (input) => {
+    createPlayer: async ({standby, ...input}) => {
       const player: Player = {
         ...input,
         id: nextId('player'),
+        joinedAt: clock,
         pairCode: `P${String(ids).padStart(3, '0')}`,
       }
       snapshot.players.push(player)
+      if (standby) {
+        const {settings} = snapshot.game
+        snapshot.game.settings = {...settings, standby: [...(settings.standby ?? []), player.id]}
+      }
       const token = `token-${player.id}`
       tokens.set(token, player.id)
       return {player, token}
@@ -84,6 +90,7 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
         questionId,
         startedAt: clock,
         finishedAt: null,
+        questionVote: null,
       })
       return 'ok'
     },
@@ -92,12 +99,18 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
       if (turn && turn.finishedAt === null) turn.finishedAt = finishedAt
     },
     claimTranscription: async (turnId) => {
-      if (transcribed.has(turnId)) return false
-      transcribed.add(turnId)
+      const at = transcribing.get(turnId)
+      const answered = responses.some((r) => r.turnId === turnId)
+      if (at !== undefined && (answered || clock - at < TRANSCRIPTION_CLAIM_TTL_MS)) return false
+      transcribing.set(turnId, clock)
       return true
     },
     releaseTranscription: async (turnId) => {
-      transcribed.delete(turnId)
+      transcribing.delete(turnId)
+    },
+    voteQuestion: async ({turnId, vote}) => {
+      const turn = snapshot.turns.find((t) => t.id === turnId)
+      if (turn) turn.questionVote = vote
     },
     saveResponse: async (input) => {
       const turn = snapshot.turns.find((t) => t.id === input.turnId)
@@ -120,6 +133,12 @@ export const createFakeGamePort = (seed: {game: HostedGame; rounds?: Round[]}) =
       responses
         .filter((r) => r.playerId === playerId && r.deletedAt === null)
         .map(({playerId: _p, deletedAt: _d, ...r}) => r),
+    editResponse: async ({responseId, playerId, transcript}) => {
+      const r = responses.find((x) => x.id === responseId && x.playerId === playerId)
+      if (!r || r.deletedAt !== null) return false
+      r.transcript = transcript
+      return true
+    },
     deleteResponse: async ({responseId, playerId}) => {
       const r = responses.find((x) => x.id === responseId && x.playerId === playerId)
       if (!r || r.deletedAt !== null) return false
